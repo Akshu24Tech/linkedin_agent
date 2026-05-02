@@ -1,6 +1,6 @@
 """
 feed_extractor.py
-─────────────────
+-----------------
 Scrolls the LinkedIn feed and extracts raw post data.
 No AI analysis here - just pure extraction.
 
@@ -76,7 +76,7 @@ async def extract_posts_from_page(page: Page, max_posts: int = 15) -> list[RawPo
 
     posts = []
 
-    # ── DOM Extraction ────────────────────────────────────────────────────────
+    # -- DOM Extraction --------------------------------------------------------
     # LinkedIn's feed posts are inside data-id containers
     # We use multiple selector strategies for resilience
     
@@ -112,7 +112,7 @@ async def extract_posts_from_page(page: Page, max_posts: int = 15) -> list[RawPo
 async def extract_single_post(page: Page, element, index: int) -> RawPost | None:
     """Extract data from a single post element."""
 
-    # ── Author name ───────────────────────────────────────────────────────────
+    # -- Author name -----------------------------------------------------------
     author_name = ""
     for selector in [
         ".feed-shared-actor__name",
@@ -129,7 +129,7 @@ async def extract_single_post(page: Page, element, index: int) -> RawPost | None
         except Exception:
             continue
 
-    # ── Author headline ───────────────────────────────────────────────────────
+    # -- Author headline -------------------------------------------------------
     author_headline = ""
     for selector in [
         ".feed-shared-actor__description",
@@ -145,7 +145,7 @@ async def extract_single_post(page: Page, element, index: int) -> RawPost | None
         except Exception:
             continue
 
-    # ── Post text ─────────────────────────────────────────────────────────────
+    # -- Post text -------------------------------------------------------------
     post_text = ""
     for selector in [
         ".feed-shared-update-v2__description",
@@ -163,7 +163,7 @@ async def extract_single_post(page: Page, element, index: int) -> RawPost | None
         except Exception:
             continue
 
-    # ── Post URL ──────────────────────────────────────────────────────────────
+    # -- Post URL --------------------------------------------------------------
     post_url = ""
     for selector in [
         "a[href*='/posts/']",
@@ -180,11 +180,11 @@ async def extract_single_post(page: Page, element, index: int) -> RawPost | None
         except Exception:
             continue
 
-    # ── Media detection ───────────────────────────────────────────────────────
+    # -- Media detection -------------------------------------------------------
     has_image = bool(await element.query_selector(".feed-shared-image, img[data-delayed-url]"))
     has_video = bool(await element.query_selector(".feed-shared-linkedin-video, video"))
 
-    # ── Engagement numbers ────────────────────────────────────────────────────
+    # -- Engagement numbers ----------------------------------------------------
     likes_approx = ""
     comments_approx = ""
     try:
@@ -207,7 +207,7 @@ async def extract_single_post(page: Page, element, index: int) -> RawPost | None
     except Exception:
         pass
 
-    # ── Post ID (for deduplication) ───────────────────────────────────────────
+    # -- Post ID (for deduplication) -------------------------------------------
     post_id = f"post_{index}_{hash(post_text[:50])}"
     try:
         data_id = await element.get_attribute("data-id")
@@ -298,7 +298,7 @@ def save_raw_posts(posts: list[RawPost], path: str = "session/raw_posts.json") -
     print(f"[v] Raw posts saved to {path}")
 
 
-# ── Standalone test ───────────────────────────────────────────────────────────
+# -- Standalone test -----------------------------------------------------------
 async def main():
     """Run this directly to test extraction (requires login first)."""
     from dotenv import load_dotenv

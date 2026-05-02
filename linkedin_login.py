@@ -1,6 +1,6 @@
 """
 linkedin_login.py
-─────────────────
+-----------------
 Handles LinkedIn login + cookie session persistence.
 
 Flow:
@@ -207,7 +207,7 @@ async def get_authenticated_browser():
         window.chrome = { runtime: {} };
     """)
 
-    # ── Try cookie-based login first ─────────────────────────────────────────
+    # -- Try cookie-based login first -----------------------------------------
     cookies_loaded = await load_cookies(context)
 
     if cookies_loaded:
@@ -219,7 +219,7 @@ async def get_authenticated_browser():
         else:
             print("[i] Saved cookies expired. Doing fresh login...")
 
-    # ── Fresh login ───────────────────────────────────────────────────────────
+    # -- Fresh login -----------------------------------------------------------
     success = await do_linkedin_login(page, email, password)
 
     if not success:
@@ -233,7 +233,7 @@ async def get_authenticated_browser():
     return pw, browser, context, page
 
 
-# ── Standalone test ───────────────────────────────────────────────────────────
+# -- Standalone test -----------------------------------------------------------
 async def main():
     """Run this directly to test your login setup."""
     from dotenv import load_dotenv
