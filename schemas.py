@@ -4,7 +4,7 @@ schemas.py
 Pydantic models for structured AI output.
 
 Every post that passes interest filtering gets analyzed into this schema.
-Gemini is forced to return exactly this structure — no hallucinated fields,
+Gemini is forced to return exactly this structure - no hallucinated fields,
 no missing keys.
 """
 
@@ -56,7 +56,7 @@ class PostAnalysis(BaseModel):
     post_summary: str = Field(
         description=(
             "2-3 sentence summary of what this post is actually about. "
-            "Be specific — not 'talks about AI' but 'explains how to implement "
+            "Be specific - not 'talks about AI' but 'explains how to implement "
             "LangGraph checkpointing with Redis for long-running agents'."
         )
     )
@@ -65,7 +65,7 @@ class PostAnalysis(BaseModel):
         description=(
             "The single most useful/actionable thing from this post. "
             "1-2 sentences max. This is the 'extract useful things' from Aksh's notes. "
-            "If there's no real insight, write: 'No concrete insight — surface level.'"
+            "If there's no real insight, write: 'No concrete insight - surface level.'"
         )
     )
 
@@ -86,7 +86,7 @@ class PostAnalysis(BaseModel):
     # -- Action recommendations ------------------------------------------------
     should_comment: bool = Field(
         description=(
-            "True if commenting would be valuable — post has traction, "
+            "True if commenting would be valuable - post has traction, "
             "Akshu has something real to add, or engaging helps with visibility. "
             "False for job posts, low-engagement posts, or posts where commenting adds nothing."
         )
@@ -95,7 +95,7 @@ class PostAnalysis(BaseModel):
     comment_draft: str = Field(
         description=(
             "If should_comment is True: draft a short, genuine comment (2-4 sentences) "
-            "in Akshu's voice — practitioner tone, direct, no cringe phrases like "
+            "in Akshu's voice - practitioner tone, direct, no cringe phrases like "
             "'Great post!' or 'Absolutely agree!'. Should add value or share a real experience. "
             "If should_comment is False: empty string."
         )
@@ -103,7 +103,7 @@ class PostAnalysis(BaseModel):
 
     should_save: bool = Field(
         description=(
-            "True if this post has lasting reference value — a technique, tool, "
+            "True if this post has lasting reference value - a technique, tool, "
             "pattern, or insight Aksh might want to revisit. "
             "False for time-sensitive news, opinions without substance, or anything "
             "that'll be irrelevant in a week."

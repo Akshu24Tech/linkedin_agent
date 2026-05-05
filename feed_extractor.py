@@ -265,7 +265,7 @@ async def extract_via_screenshot(page: Page, max_posts: int) -> list[RawPost]:
 
 async def extract_feed_posts(page: Page, max_posts: int = 15) -> list[RawPost]:
     """
-    Full pipeline: navigate to feed → scroll → extract posts.
+    Full pipeline: navigate to feed -> scroll -> extract posts.
     This is the main function called by the agent.
     """
     from linkedin_login import LINKEDIN_FEED_URL

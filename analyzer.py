@@ -3,11 +3,11 @@ analyzer.py
 ───────────
 The AI brain of the agent.
 
-Takes raw extracted posts → runs Gemini Flash structured analysis →
+Takes raw extracted posts -> runs Gemini Flash structured analysis ->
 returns PostAnalysis objects with interest scores, insights, comment drafts.
 
 Uses Gemini's native JSON schema mode for guaranteed structured output.
-No regex parsing, no prompt hacks — pure Pydantic.
+No regex parsing, no prompt hacks - pure Pydantic.
 
 Supports Gemini (primary) and Groq (fallback).
 """
@@ -25,7 +25,7 @@ load_dotenv()
 
 
 # ── Interest Profile ──────────────────────────────────────────────────────────
-# This is Akshu's interest fingerprint — what the agent filters for.
+# This is Akshu's interest fingerprint - what the agent filters for.
 # Edit this to tune what gets saved vs skipped.
 
 AKSHU_INTEREST_PROFILE = """
@@ -78,7 +78,7 @@ Engagement: {likes} likes, {comments} comments
 ─────────────────────────────────────────
 
 Analyze this post and fill in the structured output schema.
-Be strict on relevance — it's better to skip a borderline post than save noise.
+Be strict on relevance - it's better to skip a borderline post than save noise.
 For comment drafts, write like a practitioner who has actually built these systems,
 not like someone trying to network. Avoid platitudes.
 """
@@ -94,9 +94,9 @@ def get_llm():
 
     if gemini_key and gemini_key != "your_gemini_api_key_here":
         from langchain_google_genai import ChatGoogleGenerativeAI
-        print("[i] Using Gemini 2.0 Flash for analysis")
+        print("[i] Using Gemini 2.5 Flash for analysis")
         return ChatGoogleGenerativeAI(
-            model="gemini-2.0-flash",
+            model="gemini-2.5-flash",
             google_api_key=gemini_key,
             temperature=0.1,  # Low temp = consistent, structured responses
         )
@@ -122,7 +122,7 @@ def get_llm():
 def build_structured_analyzer(llm):
     """
     Wrap the LLM with structured output using PostAnalysis schema.
-    Uses json_schema mode — Gemini guarantees valid Pydantic output.
+    Uses json_schema mode - Gemini guarantees valid Pydantic output.
     """
     return llm.with_structured_output(
         schema=PostAnalysis,
@@ -170,7 +170,7 @@ def analyze_posts_batch(
 ) -> list[tuple[RawPost, PostAnalysis]]:
     """
     Analyze a batch of posts.
-    Returns list of (post, analysis) tuples — only for analyzed posts.
+    Returns list of (post, analysis) tuples - only for analyzed posts.
 
     Args:
         posts: Raw extracted posts from feed_extractor
@@ -214,7 +214,7 @@ def analyze_posts_batch(
 
         results.append((post, analysis))
 
-        # Rate limit safety — Gemini free tier = 15 req/min
+        # Rate limit safety - Gemini free tier = 15 req/min
         if i < len(posts):
             time.sleep(delay_between)
 

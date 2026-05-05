@@ -4,8 +4,8 @@ linkedin_login.py
 Handles LinkedIn login + cookie session persistence.
 
 Flow:
-  1. Check if saved cookies exist → load them (skip login)
-  2. If no cookies → do real login → save cookies for next time
+  1. Check if saved cookies exist -> load them (skip login)
+  2. If no cookies -> do real login -> save cookies for next time
   3. Verify session is valid by checking feed loads correctly
 
 Run this file standalone first to test login:
@@ -82,7 +82,7 @@ async def do_linkedin_login(page: Page, email: str, password: str) -> bool:
         Path("session").mkdir(exist_ok=True)
         await page.screenshot(path="session/login_debug.png")
         print(f"[x] Could not find #username field. URL: {page.url}")
-        print("[i] Screenshot saved to session/login_debug.png — check what LinkedIn showed.")
+        print("[i] Screenshot saved to session/login_debug.png - check what LinkedIn showed.")
         return False
 
     # Fill email
