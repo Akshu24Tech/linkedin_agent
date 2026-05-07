@@ -1,496 +1,383 @@
 """
-agent.py - Day 4 (Hardened)
-Full pipeline: Auth -> Extract -> Analyze -> Save -> Log
+agent.py
+─────────
+LinkedIn Feed Intelligence Agent — full hardened pipeline.
 
-New in Day 4:
-- Stealth browser (anti-detection patches)
-- Retry engine with exponential backoff
-- Screenshot fallback when DOM fails
-- RunStats tracker
-- Graceful shutdown (Ctrl+C safe)
-- Pre-run cookie freshness check
+COMMANDS:
+  python agent.py                  # Full run: extract → analyze → save
+  python agent.py --extract-only   # Just grab posts, save raw JSON
+  python agent.py --analyze-only   # Re-analyze session/raw_posts.json (no LinkedIn)
+  python agent.py --dry-run        # Analyze but don't save to Notion
+  python agent.py --stats          # Show run history and dedup stats
+  python agent.py --test-notion    # Test Notion connection only
+  python agent.py --view-saved     # Pretty-print last saved posts from JSON
+  python agent.py --clear-seen     # Reset dedup store (re-process all posts)
 """
 
 import asyncio
 import json
 import os
-import signal
 import sys
-import time
+import argparse
 from pathlib import Path
-
+from datetime import datetime
 from dotenv import load_dotenv
+from dataclasses import asdict
+
 load_dotenv()
 
-from stealth_browser import launch_stealth_browser, load_cookies_into_context, human_delay, human_scroll
-from retry_engine import RunStats, with_retry
-
-# ── Config ────────────────────────────────────────────────────────────────────
-MAX_POSTS = int(os.getenv("MAX_POSTS", "15"))        # Posts to analyze per run
-RELEVANCE_THRESHOLD = int(os.getenv("RELEVANCE_THRESHOLD", "7"))  # Min score to save
-HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
-COOKIE_FILE = "session/linkedin_cookies.json"
-RAW_POSTS_FILE = "session/raw_posts.json"
-ANALYZED_FILE = "session/analyzed_posts.json"
+from logger import setup_logger, LOG_FILE
+log = setup_logger("agent")
 
 
-# ── Graceful shutdown ─────────────────────────────────────────────────────────
-_shutdown = False
+# ── CLI Parser ────────────────────────────────────────────────────────────────
 
-def _handle_sigint(sig, frame):
-    global _shutdown
-    print("\n\n[agent] Ctrl+C received - finishing current post then stopping...")
-    _shutdown = True
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="LinkedIn Feed Intelligence Agent",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python agent.py                  Full run (extract + analyze + save)
+  python agent.py --dry-run        Full run but skip Notion save
+  python agent.py --analyze-only   Re-analyze last extraction (no browser)
+  python agent.py --test-notion    Verify Notion connection
+  python agent.py --stats          Show dedup stats and run history
+  python agent.py --view-saved     Print last saved posts to terminal
+        """
+    )
+    parser.add_argument("--extract-only",  action="store_true", help="Extract posts, skip analysis")
+    parser.add_argument("--analyze-only",  action="store_true", help="Analyze raw_posts.json, skip extraction")
+    parser.add_argument("--dry-run",       action="store_true", help="Analyze but don't save to Notion")
+    parser.add_argument("--stats",         action="store_true", help="Show agent stats and exit")
+    parser.add_argument("--test-notion",   action="store_true", help="Test Notion connection and exit")
+    parser.add_argument("--view-saved",    action="store_true", help="Pretty-print last analyzed posts")
+    parser.add_argument("--clear-seen",    action="store_true", help="Reset dedup store")
+    parser.add_argument("--posts", type=int, default=None, help="Override POSTS_TO_COLLECT")
+    parser.add_argument("--threshold", type=int, default=7, help="Min score to save (default: 7)")
+    return parser.parse_args()
 
-signal.signal(signal.SIGINT, _handle_sigint)
+
+# ── Individual Commands ───────────────────────────────────────────────────────
+
+def cmd_stats():
+    from dedup_store import stats as dedup_stats
+    ds = dedup_stats()
+    print("\n" + "═"*50)
+    print("  Agent Stats")
+    print("═"*50)
+    print(f"  Dedup store:    {ds['total_seen']} posts seen")
+    print(f"  Last updated:   {ds['last_updated']}")
+
+    if Path("session/analyzed_posts.json").exists():
+        with open("session/analyzed_posts.json") as f:
+            data = json.load(f)
+        saved = [d for d in data if d["analysis"]["should_save"] and d["analysis"]["relevance_score"] >= 7]
+        print(f"  Last run:       {len(data)} analyzed, {len(saved)} saved")
+
+    print(f"  Log file:       {LOG_FILE}")
+    if Path("session/notion_db_id.txt").exists():
+        db_id = Path("session/notion_db_id.txt").read_text().strip()
+        print(f"  Notion DB:      {db_id[:8]}...{db_id[-4:]}")
+    print()
 
 
-# ── Step 1: Auth ──────────────────────────────────────────────────────────────
+def cmd_view_saved():
+    path = Path("session/analyzed_posts.json")
+    if not path.exists():
+        print("[!] No analyzed_posts.json found. Run the agent first.")
+        return
 
-async def check_session_fresh() -> bool:
-    """Check if saved cookies are likely still valid (< 7 days old)."""
-    p = Path(COOKIE_FILE)
-    if not p.exists():
-        return False
-    age_hours = (time.time() - p.stat().st_mtime) / 3600
-    if age_hours > 168:  # 7 days
-        print(f"[auth] Cookies are {age_hours:.0f}h old - may need re-login")
-        return False
-    print(f"[auth] Cookies are {age_hours:.1f}h old - should be fresh [OK]")
-    return True
+    with open(path) as f:
+        data = json.load(f)
+
+    saved = [d for d in data if d["analysis"]["should_save"] and d["analysis"]["relevance_score"] >= 7]
+
+    print(f"\n{'═'*60}")
+    print(f"  Saved Posts ({len(saved)} from last run)")
+    print(f"{'═'*60}")
+
+    for i, item in enumerate(saved, 1):
+        p = item["post"]
+        a = item["analysis"]
+        score_bar = "█" * a["relevance_score"] + "░" * (10 - a["relevance_score"])
+
+        print(f"\n[{i}] {p['author_name']}  [{score_bar}] {a['relevance_score']}/10")
+        print(f"     {p['author_headline'][:70]}")
+        print(f"\n     SUMMARY:")
+        print(f"     {a['post_summary']}")
+        print(f"\n     💡 INSIGHT:")
+        print(f"     {a['key_insight']}")
+
+        if a["comment_draft"]:
+            print(f"\n     💬 COMMENT DRAFT:")
+            print(f"     {a['comment_draft']}")
+
+        if a["content_angle"]:
+            print(f"\n     ✍️  CONTENT ANGLE:")
+            print(f"     {a['content_angle']}")
+
+        if p["post_url"]:
+            print(f"\n     🔗 {p['post_url'][:80]}")
+
+        print("\n     " + "─"*55)
+
+    if not saved:
+        print("\n  No posts met save threshold in last run.")
+    print()
 
 
-async def verify_linkedin_session(page) -> bool:
-    """Navigate to LinkedIn and check if we're actually logged in."""
+def cmd_clear_seen():
+    store_path = Path("session/seen_posts.json")
+    if store_path.exists():
+        store_path.unlink()
+        print("[✓] Dedup store cleared. All posts will be re-analyzed next run.")
+    else:
+        print("[i] Dedup store was already empty.")
+
+
+def cmd_test_notion():
+    from notion_saver import get_or_create_database, get_headers
+    import requests
+
+    print("\n[→] Testing Notion connection...")
     try:
-        await page.goto("https://www.linkedin.com/feed/", timeout=20000, wait_until="domcontentloaded")
-        await human_delay(2000, 3500)
-
-        # If redirected to login page, we're not authenticated
-        current_url = page.url
-        if "login" in current_url or "authwall" in current_url:
-            print("[auth] [FAIL] Session invalid - cookies rejected by LinkedIn")
-            return False
-
-        # Check for feed-specific element
-        try:
-            await page.wait_for_selector(".scaffold-layout__main, .feed-identity-module", timeout=8000)
-            print("[auth] [OK] Session valid - feed loaded")
-            return True
-        except Exception:
-            print("[auth] [WARN] Feed element not found - may need fresh login")
-            return False
-    except Exception as e:
-        print(f"[auth] Error checking session: {e}")
-        return False
-
-
-async def do_fresh_login(page, context) -> bool:
-    """Perform a fresh LinkedIn login and save cookies."""
-    email = os.getenv("LINKEDIN_EMAIL")
-    password = os.getenv("LINKEDIN_PASSWORD")
-
-    if not email or not password:
-        print("[auth] [FAIL] LINKEDIN_EMAIL / LINKEDIN_PASSWORD not set in .env")
-        return False
-
-    print("[auth] Performing fresh login...")
-    await page.goto("https://www.linkedin.com/login", wait_until="networkidle", timeout=20000)
-    await human_delay(1500, 2500)
-
-    # Type email like a human
-    await page.fill("#username", "")
-    await human_delay(300, 600)
-    for char in email:
-        await page.type("#username", char, delay=random.randint(50, 150))
-    await human_delay(400, 800)
-
-    # Type password
-    await page.fill("#password", "")
-    await human_delay(200, 500)
-    for char in password:
-        await page.type("#password", char, delay=random.randint(40, 120))
-    await human_delay(500, 1000)
-
-    await page.click('[data-litms-control-urn="login-submit"]')
-    await human_delay(3000, 5000)
-
-    # Handle CAPTCHA / verification
-    current = page.url
-    if "challenge" in current or "checkpoint" in current:
-        print("[auth] [SEC] LinkedIn is asking for verification - solve it manually in the browser")
-        print("[auth] Waiting up to 120 seconds...")
-        for _ in range(24):
-            await asyncio.sleep(5)
-            if "feed" in page.url:
-                break
+        headers = get_headers()
+        # Test auth
+        res = requests.get("https://api.notion.com/v1/users/me", headers=headers)
+        if res.status_code == 200:
+            user = res.json()
+            print(f"[✓] Notion auth OK — integration: {user.get('name', 'Unknown')}")
         else:
-            print("[auth] [FAIL] Timeout waiting for manual verification")
-            return False
+            print(f"[✗] Auth failed: {res.status_code} {res.text[:100]}")
+            return
 
-    if "feed" not in page.url and "login" in page.url:
-        print("[auth] [FAIL] Login failed - check credentials in .env")
-        return False
+        # Test DB access
+        db_id = get_or_create_database()
+        print(f"[✓] Database ready: {db_id[:8]}...{db_id[-4:]}")
+        print("[✓] Notion connection fully working!")
 
-    # Save fresh cookies
-    from stealth_browser import save_cookies_from_context
-    await save_cookies_from_context(context, COOKIE_FILE)
-    print("[auth] [OK] Fresh login successful, cookies saved")
-    return True
+    except Exception as e:
+        print(f"[✗] Notion error: {e}")
 
 
-# ── Step 2: Feed Extraction ───────────────────────────────────────────────────
+# ── Core Pipeline Steps ───────────────────────────────────────────────────────
 
-async def extract_feed_posts(page, stats: RunStats) -> list[dict]:
-    """
-    Scroll the feed and extract posts.
-    Tries multiple DOM selectors, falls back to screenshot if all fail.
-    """
-    print("\n[extract] Starting feed extraction...")
-    posts = []
-    seen_texts = set()
+async def step_extract(max_posts: int) -> list:
+    """Step 1: Open LinkedIn, extract posts."""
+    from linkedin_login import get_authenticated_browser
+    from feed_extractor import extract_feed_posts
 
-    # Multiple selector strategies - LinkedIn changes these frequently
-    POST_SELECTORS = [
-        "div.feed-shared-update-v2",
-        "div[data-urn*='activity']",
-        "li.occludable-update",
-        "div.update-components-text",
+    log.info(f"[extract] Starting browser, targeting {max_posts} posts")
+    pw, browser, context, page = await get_authenticated_browser()
+
+    try:
+        posts = await extract_feed_posts(page, max_posts=max_posts)
+
+        # Vision fallback if DOM extraction returned nothing useful
+        real_posts = [p for p in posts if p.post_id != "screenshot_mode"]
+        if not real_posts and Path("session/feed_screenshot.png").exists():
+            log.warning("[extract] DOM extraction empty — trying vision fallback...")
+            from vision_fallback import run_vision_fallback
+            posts = run_vision_fallback("session/feed_screenshot.png")
+            if posts:
+                log.info(f"[extract] Vision fallback got {len(posts)} posts")
+            else:
+                log.error("[extract] Vision fallback also failed. Check screenshot manually.")
+
+        return posts
+
+    finally:
+        await browser.close()
+        await pw.stop()
+        log.info("[extract] Browser closed.")
+
+
+def step_analyze(posts: list, threshold: int = 7) -> tuple[list, list]:
+    """Step 2: Filter new posts, run Gemini analysis."""
+    from dedup_store import filter_new_posts, mark_posts_seen
+    from analyzer import analyze_posts_batch, filter_saved_posts
+
+    # Skip already-seen posts
+    new_posts, skipped = filter_new_posts(posts)
+
+    if not new_posts:
+        log.info("[analyze] All posts already seen — nothing new to analyze.")
+        return [], []
+
+    log.info(f"[analyze] Analyzing {len(new_posts)} new posts ({skipped} skipped as seen)")
+    all_results = analyze_posts_batch(new_posts, delay_between=1.5)
+
+    # Mark all as seen (regardless of whether saved — don't re-check next run)
+    mark_posts_seen(new_posts)
+
+    # Filter by threshold
+    saved = [
+        (p, a) for p, a in all_results
+        if a.is_relevant and a.relevance_score >= threshold and a.should_save
     ]
 
-    TEXT_SELECTORS = [
-        ".feed-shared-update-v2__description .break-words",
-        ".update-components-text .break-words",
-        ".feed-shared-text .break-words span[dir='ltr']",
-        ".update-components-text span[dir='ltr']",
-        ".attributed-text-segment-list__content",
-    ]
+    return all_results, saved
 
-    AUTHOR_SELECTORS = [
-        ".update-components-actor__name span[aria-hidden='true']",
-        ".feed-shared-actor__name",
-        ".update-components-actor__title span[aria-hidden='true']",
-    ]
 
-    ROLE_SELECTORS = [
-        ".update-components-actor__description span[aria-hidden='true']",
-        ".feed-shared-actor__sub-description .visually-hidden",
-    ]
+def step_save_notion(all_results: list) -> int:
+    """Step 3: Save relevant posts to Notion."""
+    from notion_saver import save_posts_to_notion
+    return save_posts_to_notion(all_results)
 
-    URL_SELECTORS = [
-        "a.app-aware-link[href*='/posts/']",
-        "a[href*='activity']",
-    ]
 
-    scroll_rounds = 0
-    max_scrolls = 6
+def step_persist_json(all_results: list) -> None:
+    """Always save full results to JSON as local backup."""
+    Path("session").mkdir(exist_ok=True)
+    output = [{"post": asdict(p), "analysis": a.model_dump()} for p, a in all_results]
+    with open("session/analyzed_posts.json", "w", encoding="utf-8") as f:
+        json.dump(output, f, indent=2, ensure_ascii=False)
+    log.info("[persist] Saved → session/analyzed_posts.json")
 
-    while len(posts) < MAX_POSTS and scroll_rounds < max_scrolls and not _shutdown:
-        # Try to find post containers
-        dom_worked = False
-        for post_sel in POST_SELECTORS:
-            try:
-                containers = await page.query_selector_all(post_sel)
-                if len(containers) >= 2:
-                    dom_worked = True
 
-                    for container in containers:
-                        if len(posts) >= MAX_POSTS:
-                            break
+def load_raw_posts_from_json() -> list:
+    """Load previously extracted raw posts from JSON (for --analyze-only)."""
+    path = Path("session/raw_posts.json")
+    if not path.exists():
+        log.error("[load] session/raw_posts.json not found. Run extraction first.")
+        sys.exit(1)
 
-                        # Extract text
-                        text = ""
-                        for txt_sel in TEXT_SELECTORS:
-                            try:
-                                el = await container.query_selector(txt_sel)
-                                if el:
-                                    text = (await el.inner_text()).strip()
-                                    if len(text) > 30:
-                                        break
-                            except Exception:
-                                continue
+    from feed_extractor import RawPost
+    with open(path) as f:
+        data = json.load(f)
 
-                        if not text or len(text) < 30:
-                            continue
-
-                        # Dedup by first 100 chars
-                        key = text[:100]
-                        if key in seen_texts:
-                            continue
-                        seen_texts.add(key)
-
-                        # Extract author
-                        author = "Unknown"
-                        for a_sel in AUTHOR_SELECTORS:
-                            try:
-                                el = await container.query_selector(a_sel)
-                                if el:
-                                    author = (await el.inner_text()).strip()
-                                    if author:
-                                        break
-                            except Exception:
-                                continue
-
-                        # Extract role
-                        role = ""
-                        for r_sel in ROLE_SELECTORS:
-                            try:
-                                el = await container.query_selector(r_sel)
-                                if el:
-                                    role = (await el.inner_text()).strip()
-                                    if role:
-                                        break
-                            except Exception:
-                                continue
-
-                        # Extract URL
-                        url = ""
-                        for u_sel in URL_SELECTORS:
-                            try:
-                                el = await container.query_selector(u_sel)
-                                if el:
-                                    href = await el.get_attribute("href")
-                                    if href:
-                                        url = href.split("?")[0]  # Remove tracking params
-                                        break
-                            except Exception:
-                                continue
-
-                        posts.append({
-                            "author": author,
-                            "role": role,
-                            "text": text[:2000],  # Cap at 2000 chars
-                            "url": url,
-                            "source": "dom",
-                            "scraped_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                        })
-                        stats.posts_dom_scraped += 1
-
-                    if dom_worked:
-                        break  # Found working selector, don't try others
-            except Exception as e:
-                stats.log_error("dom", f"Selector '{post_sel}' failed: {type(e).__name__}")
-                continue
-
-        # Screenshot fallback if DOM completely failed
-        if not dom_worked and scroll_rounds == 0:
-            print("[extract] [WARN] All DOM selectors failed - trying screenshot fallback")
-            try:
-                fallback_posts = await screenshot_extract_posts_simple(page)
-                for p in fallback_posts:
-                    posts.append(p)
-                    stats.posts_screenshot_fallback += 1
-            except Exception as e:
-                stats.log_error("dom", f"Screenshot fallback also failed: {e}")
-
-        scroll_rounds += 1
-        if len(posts) < MAX_POSTS:
-            print(f"[extract] Scroll {scroll_rounds}/{max_scrolls} - {len(posts)} posts so far")
-            await human_scroll(page, scrolls=3)
-
-    stats.posts_found = len(posts)
-    print(f"[extract] Done - {len(posts)} unique posts extracted")
-
-    # Save raw posts
-    Path(RAW_POSTS_FILE).write_text(json.dumps(posts, indent=2, ensure_ascii=False))
+    posts = [RawPost(**p) for p in data]
+    log.info(f"[load] Loaded {len(posts)} posts from raw_posts.json")
     return posts
 
 
-async def screenshot_extract_posts_simple(page) -> list[dict]:
-    """Simple screenshot fallback using Gemini Vision."""
-    import base64
-    import google.generativeai as genai
-    from PIL import Image
-    import io
+# ── Print Summary ─────────────────────────────────────────────────────────────
 
-    genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-    model = genai.GenerativeModel("gemini-2.5-flash")
+def print_run_summary(all_results, saved_posts, notion_count, dry_run=False):
+    total = len(all_results)
+    saved = len(saved_posts)
 
-    shot = await page.screenshot(full_page=False)
-    img = Image.open(io.BytesIO(shot))
+    print("\n" + "═"*60)
+    print(f"  RUN COMPLETE  {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print("═"*60)
+    print(f"  Analyzed:      {total} posts")
+    print(f"  Relevant:      {saved} posts (scored ≥7/10)")
 
-    prompt = """LinkedIn feed screenshot. Extract all visible posts as JSON array.
-Each item: {"author":"name","role":"job title","text":"post content","url":"","source":"screenshot"}
-Return ONLY valid JSON array. No markdown, no explanation."""
+    if dry_run:
+        print(f"  Notion:        [DRY RUN — not saved]")
+    else:
+        print(f"  Saved Notion:  {notion_count}")
 
-    resp = model.generate_content([prompt, img])
-    raw = resp.text.strip().strip("```json").strip("```").strip()
-    return json.loads(raw)
+    print(f"  Log:           {LOG_FILE}")
+    print("═"*60)
 
-
-# ── Step 3: Analysis ──────────────────────────────────────────────────────────
-
-async def analyze_posts(posts: list[dict], stats: RunStats) -> list[dict]:
-    """Run Gemini interest-matching analysis on all posts."""
-    # Import analyzer from Day 2
-    try:
-        from analyzer import PostAnalyzer
-        analyzer = PostAnalyzer()
-    except ImportError:
-        print("[analyze] [FAIL] analyzer.py not found - skipping analysis")
-        return posts
-
-    print(f"\n[analyze] Analyzing {len(posts)} posts with Gemini...")
-    analyzed = []
-    scores = []
-
-    for i, post in enumerate(posts, 1):
-        if _shutdown:
-            print("[analyze] Shutdown requested - stopping analysis")
-            break
-
-        print(f"\n  [{i}/{len(posts)}] {post.get('author', 'Unknown')[:30]}")
-
-        try:
-            result = await with_retry(
-                analyzer.analyze_post,
-                post,
-                max_attempts=3,
-                base_delay=2.0,
-                label=f"analyze_post_{i}",
-            )
-            stats.posts_analyzed += 1
-            scores.append(result.relevance_score)
-
-            if result.should_save:
-                stats.posts_relevant += 1
-                analyzed.append({**post, "analysis": result.dict()})
-            else:
-                stats.posts_skipped += 1
-
-        except Exception as e:
-            stats.log_error("analysis", f"Post {i} by {post.get('author','?')}: {e}")
-            stats.posts_skipped += 1
-
-        # Small delay between API calls - don't hammer Gemini
-        await asyncio.sleep(0.5)
-
-    if scores:
-        stats.avg_relevance_score = round(sum(scores) / len(scores), 1)
-
-    print(f"\n[analyze] Done - {stats.posts_relevant} relevant / {stats.posts_analyzed} analyzed")
-    Path(ANALYZED_FILE).write_text(json.dumps(analyzed, indent=2, ensure_ascii=False))
-    return analyzed
+    if saved_posts:
+        print()
+        for i, (post, analysis) in enumerate(saved_posts, 1):
+            score_bar = "█" * analysis.relevance_score + "░" * (10 - analysis.relevance_score)
+            print(f"  [{i}] [{score_bar}] {analysis.relevance_score}/10  {post.author_name}")
+            print(f"       {analysis.post_summary[:100]}...")
+            print(f"       💡 {analysis.key_insight[:85]}...")
+            if analysis.comment_draft:
+                print(f"       💬 Comment drafted — run --view-saved to copy it")
+            if analysis.content_angle:
+                print(f"       ✍️  {analysis.content_angle[:70]}...")
+            print()
+    else:
+        print("\n  No posts met threshold. Tips:")
+        print("  • Run --clear-seen to reprocess old posts")
+        print("  • Lower --threshold to 6 to capture more")
+        print("  • Try scrolling more (increase POSTS_TO_COLLECT in .env)")
+        print()
 
 
-# ── Step 4: Notion Save ───────────────────────────────────────────────────────
-
-async def save_to_notion(analyzed: list[dict], stats: RunStats):
-    """Save all relevant posts to Notion with retry."""
-    try:
-        from notion_saver import NotionSaver
-        saver = NotionSaver()
-    except ImportError:
-        print("[notion] [FAIL] notion_saver.py not found - skipping Notion save")
-        return
-
-    print(f"\n[notion] Saving {len(analyzed)} posts to Notion...")
-
-    for i, post in enumerate(analyzed, 1):
-        if _shutdown:
-            break
-
-        try:
-            result = await with_retry(
-                saver.save_post,
-                post,
-                max_attempts=3,
-                base_delay=3.0,
-                label=f"notion_save_{i}",
-            )
-
-            if result == "exists":
-                stats.posts_already_existed += 1
-                print(f"  [{i}] Already in Notion (dedup)")
-            elif result:
-                stats.posts_saved_notion += 1
-                print(f"  [{i}] Saved: {post.get('author','?')[:25]}")
-
-        except Exception as e:
-            stats.log_error("notion", f"Post {i}: {e}")
-
-        await asyncio.sleep(0.3)  # Notion rate limit: 3 req/sec
-
-
-# ── Main orchestrator ─────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 async def main():
-    stats = RunStats()
-    pw = browser = context = page = None
+    args = parse_args()
 
-    print("\n" + "=" * 55)
-    print("  LINKEDIN AGENT - DAY 4 (HARDENED)")
-    print("=" * 55)
+    # ── One-shot commands ─────────────────────────────────────────────────────
+    if args.stats:
+        cmd_stats()
+        return
 
-    try:
-        # ── Browser setup ──────────────────────────────────────────────────
-        print("\n[1/4] Setting up stealth browser...")
-        pw, browser, context = await launch_stealth_browser(headless=HEADLESS)
-        page = await context.new_page()
+    if args.view_saved:
+        cmd_view_saved()
+        return
 
-        # ── Auth ───────────────────────────────────────────────────────────
-        print("\n[2/4] Authentication...")
-        cookies_loaded = await load_cookies_into_context(context, COOKIE_FILE)
+    if args.clear_seen:
+        cmd_clear_seen()
+        return
 
-        if cookies_loaded:
-            session_ok = await verify_linkedin_session(page)
-        else:
-            session_ok = False
+    if args.test_notion:
+        cmd_test_notion()
+        return
 
-        if not session_ok:
-            print("[auth] No valid session - performing fresh login")
-            login_ok = await do_fresh_login(page, context)
-            if not login_ok:
-                print("[auth] [FAIL] Cannot authenticate - stopping")
-                return
-            # Navigate to feed after login
-            await page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded")
-            await human_delay(2000, 3000)
+    # ── Pipeline ──────────────────────────────────────────────────────────────
+    max_posts = args.posts or int(os.getenv("POSTS_TO_COLLECT", "15"))
 
-        # ── Extract ────────────────────────────────────────────────────────
-        print("\n[3/4] Extracting feed posts...")
-        posts = await extract_feed_posts(page, stats)
+    print("\n" + "═"*60)
+    print("  LinkedIn Feed Intelligence Agent")
+    print("═"*60)
 
-        # Close browser - no longer needed after extraction
-        await browser.close()
-        await pw.stop()
-        pw = browser = context = page = None
-        print("[browser] Browser closed [OK]")
+    # ── Extract ───────────────────────────────────────────────────────────────
+    if args.analyze_only:
+        print("\n[STEP 1] Loading from session/raw_posts.json (--analyze-only)")
+        print("─"*42)
+        posts = load_raw_posts_from_json()
+    else:
+        print(f"\n[STEP 1] Extraction ({max_posts} posts)")
+        print("─"*42)
+        try:
+            posts = await step_extract(max_posts)
+        except Exception as e:
+            log.error(f"[extract] Fatal error: {e}")
+            print(f"\n[✗] Extraction failed: {e}")
+            print("    Check session/agent.log for details")
+            sys.exit(1)
 
         if not posts:
-            print("[agent] No posts extracted - nothing to analyze")
-            return
+            print("[✗] No posts extracted. Exiting.")
+            sys.exit(1)
 
-        # ── Analyze ────────────────────────────────────────────────────────
-        print("\n[4/4] Analyzing posts + saving to Notion...")
-        analyzed = await analyze_posts(posts, stats)
+    if args.extract_only:
+        print(f"\n[✓] Extracted {len(posts)} posts. Saved to session/raw_posts.json")
+        print("    Run again without --extract-only to analyze.")
+        return
 
-        if analyzed:
-            await save_to_notion(analyzed, stats)
-        else:
-            print("[agent] No relevant posts found this run")
-
+    # ── Analyze ───────────────────────────────────────────────────────────────
+    print(f"\n[STEP 2] AI Analysis")
+    print("─"*42)
+    try:
+        all_results, saved_posts = step_analyze(posts, threshold=args.threshold)
     except Exception as e:
-        import traceback
-        print(f"\n[agent] [FAIL] Unhandled error: {e}")
-        traceback.print_exc()
+        log.error(f"[analyze] Fatal error: {e}")
+        print(f"\n[✗] Analysis failed: {e}")
+        sys.exit(1)
 
-    finally:
-        # Always close browser if still open
+    if not all_results:
+        print("[i] Nothing new to analyze this run.")
+        return
+
+    step_persist_json(all_results)
+
+    # ── Save to Notion ────────────────────────────────────────────────────────
+    notion_count = 0
+    if not args.dry_run:
+        print(f"\n[STEP 3] Saving to Notion")
+        print("─"*42)
         try:
-            if browser:
-                await browser.close()
-            if pw:
-                await pw.stop()
-        except Exception:
-            pass
+            notion_count = step_save_notion(all_results)
+        except Exception as e:
+            log.error(f"[notion] Save failed: {e}")
+            print(f"[!] Notion save failed: {e}")
+            print("    Posts saved locally to session/analyzed_posts.json")
+    else:
+        print("\n[STEP 3] Notion save SKIPPED (--dry-run)")
 
-        # Always save stats
-        stats.finish()
-        stats.save()
-        stats.print_summary()
+    # ── Summary ───────────────────────────────────────────────────────────────
+    print_run_summary(all_results, saved_posts, notion_count, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
-    import random  # needed for do_fresh_login
     asyncio.run(main())

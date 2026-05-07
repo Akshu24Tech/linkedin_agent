@@ -57,7 +57,18 @@ async def scroll_feed(page: Page, scroll_count: int = 5) -> None:
     for i in range(scroll_count):
         # Scroll down by a random-ish amount (human-like)
         scroll_amount = 600 + (i % 3) * 150
-        await page.evaluate(f"window.scrollBy(0, {scroll_amount})")
+        try:
+            await page.evaluate(f"window.scrollBy(0, {scroll_amount})")
+        except Exception as e:
+            print(f"[!] Scroll {i+1} interrupted ({e}), waiting for page to settle...")
+            await asyncio.sleep(3)
+            try:
+                # Page may have navigated — wait for it to settle
+                await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                await page.evaluate(f"window.scrollBy(0, {scroll_amount})")
+            except Exception:
+                print(f"[!] Scroll {i+1} skipped.")
+                continue
         # Random pause between scrolls (1.5s - 3s)
         await asyncio.sleep(1.5 + (i % 2) * 0.8)
 
@@ -240,10 +251,19 @@ async def extract_via_screenshot(page: Page, max_posts: int) -> list[RawPost]:
     FALLBACK: Take a screenshot and use Gemini vision to read posts.
     Used when LinkedIn's DOM structure has changed and selectors break.
     """
-    print("[->] Screenshot fallback: capturing feed...")
+    print("[->] Screenshot fallback: scrolling further to load feed posts...")
+    # Scroll down more to get past "Recommended" section into actual feed
+    for _ in range(5):
+        try:
+            await page.evaluate("window.scrollBy(0, 800)")
+        except Exception:
+            pass
+        await asyncio.sleep(1.2)
+
     Path("session").mkdir(exist_ok=True)
     screenshot_path = "session/feed_screenshot.png"
-    await page.screenshot(path=screenshot_path, full_page=False)
+    # full_page=True captures everything loaded, not just viewport
+    await page.screenshot(path=screenshot_path, full_page=True)
     print(f"[v] Screenshot saved: {screenshot_path}")
     print("[i] Screenshot ready for vision analysis (handled in main agent).")
 
@@ -275,6 +295,13 @@ async def extract_feed_posts(page: Page, max_posts: int = 15) -> list[RawPost]:
         print("[->] Navigating to LinkedIn feed...")
         await page.goto(LINKEDIN_FEED_URL, wait_until="domcontentloaded")
         await asyncio.sleep(3)
+
+    # Wait for page to fully stabilise before scrolling
+    try:
+        await page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:
+        pass  # networkidle timeout is OK, continue anyway
+    await asyncio.sleep(2)
 
     # Scroll to load more posts
     scroll_count = max(3, max_posts // 4)

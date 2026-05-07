@@ -1,6 +1,6 @@
 # LinkedIn Feed Intelligence Agent
 
-Personal AI agent that opens LinkedIn, reads your feed, filters posts by your interests, and saves the useful ones to Notion — so you never miss relevant content while scrolling.
+Personal AI agent that opens LinkedIn autonomously → reads your feed → filters posts by your interests → saves the good ones to Notion with summaries, key insights, and comment drafts.
 
 ---
 
@@ -8,144 +8,156 @@ Personal AI agent that opens LinkedIn, reads your feed, filters posts by your in
 
 ```
 linkedin_agent/
-├── .env.example          ← copy this to .env, fill in credentials
-├── requirements.txt      ← Python dependencies
-├── agent.py              ← main entry point (run this)
-├── linkedin_login.py     ← handles login + cookie session
-├── feed_extractor.py     ← scrolls feed, extracts post data
-├── session/              ← auto-created, stores cookies + debug output
-│   ├── linkedin_cookies.json
-│   ├── raw_posts.json
-│   └── feed_screenshot.png
-└── README.md
+├── agent.py              ← main entry point (all commands)
+├── linkedin_login.py     ← cookie-based session management
+├── feed_extractor.py     ← Playwright DOM scraper
+├── vision_fallback.py    ← Gemini vision when DOM breaks
+├── analyzer.py           ← Gemini interest matching + extraction
+├── schemas.py            ← Pydantic structured output model
+├── notion_saver.py       ← Notion database + rich page creation
+├── dedup_store.py        ← cross-run deduplication
+├── retry.py              ← exponential backoff for API calls
+├── logger.py             ← structured logging to file + console
+├── .env.example          ← copy → .env, fill credentials
+├── requirements.txt
+└── session/              ← auto-created
+    ├── linkedin_cookies.json
+    ├── seen_posts.json       ← dedup store
+    ├── raw_posts.json        ← last extraction
+    ├── analyzed_posts.json   ← last analysis results
+    ├── feed_screenshot.png   ← vision fallback screenshot
+    └── agent.log             ← full run log
 ```
 
 ---
 
-## Day 1 Setup — Exact Commands
-
-### 1. Prerequisites
-
-Make sure you have Python 3.11+ installed:
-```bash
-python --version
-# Should show Python 3.11.x or higher
-```
-
-### 2. Create virtual environment
+## Setup (one-time)
 
 ```bash
-# Navigate to project folder
-cd linkedin_agent
-
-# Create venv
+# 1. Create venv + install deps
 python -m venv venv
-
-# Activate it
-# Windows:
-venv\Scripts\activate
-# Mac/Linux:
-source venv/bin/activate
-```
-
-### 3. Install dependencies
-
-```bash
+venv\Scripts\activate          # Windows
+source venv/bin/activate       # Mac/Linux
 pip install -r requirements.txt
-```
-
-### 4. Install Playwright browsers
-
-```bash
 playwright install chromium
-```
-This downloads a clean Chromium browser (~150MB). One-time setup.
 
-### 5. Set up your credentials
-
-```bash
-# Copy the template
+# 2. Configure credentials
 cp .env.example .env
+# Fill in: GEMINI_API_KEY, LINKEDIN_EMAIL, LINKEDIN_PASSWORD
+# Fill in: NOTION_TOKEN, NOTION_PARENT_PAGE_ID
 
-# Edit .env and fill in:
-# - GEMINI_API_KEY  (get free at https://aistudio.google.com/apikey)
-# - LINKEDIN_EMAIL
-# - LINKEDIN_PASSWORD
+# 3. Test each piece independently
+python linkedin_login.py       # Test LinkedIn auth
+python analyzer.py             # Test Gemini (uses mock posts, no LinkedIn)
+python notion_saver.py         # Test Notion connection
+
+# 4. Test Notion via CLI
+python agent.py --test-notion
 ```
 
-### 6. Test login first
+---
+
+## Daily Usage
 
 ```bash
-python linkedin_login.py
-```
-
-**What happens:**
-- Browser opens (you'll see it, not headless)
-- Logs into LinkedIn with your credentials
-- Saves cookies to `session/linkedin_cookies.json`
-- Takes a screenshot to `session/login_test.png`
-
-**If LinkedIn shows CAPTCHA:** Just solve it manually in the browser window. The script waits 30 seconds.
-
-### 7. Run the full Day 1 agent
-
-```bash
+# Full run (most common)
 python agent.py
+
+# Dry run — analyze but don't write to Notion yet
+python agent.py --dry-run
+
+# Just pull posts (no AI, fast)
+python agent.py --extract-only
+
+# Re-analyze last extraction without opening LinkedIn
+python agent.py --analyze-only
+
+# See what was saved last run (with comment drafts)
+python agent.py --view-saved
+
+# Check stats
+python agent.py --stats
+
+# Reset dedup — reprocess posts already seen
+python agent.py --clear-seen
+
+# Pull more posts this run
+python agent.py --posts 25
+
+# Lower save threshold (default 7)
+python agent.py --threshold 6
 ```
 
-**What happens:**
-- Loads saved cookies (no re-login needed)
-- Opens LinkedIn feed
-- Scrolls down to load posts
-- Extracts post text, author, URL, engagement
-- Saves everything to `session/raw_posts.json`
-- Prints a preview of first 3 posts
+---
+
+## What Gets Saved to Notion
+
+Each page in your `LinkedIn Feed Intelligence` database contains:
+
+| Field | Example |
+|-------|---------|
+| Title | `Shreya Shankar: Benchmark results comparing RAG retrieval...` |
+| Score | `9` |
+| Topics | `RAG pipelines`, `AI engineering` |
+| Comment Drafted | ✅ |
+| Post URL | Direct link |
+
+**Inside each page:**
+- 📋 Summary (2-3 sentences)
+- 💡 Key insight (callout block)
+- 📝 Original post text + author
+- 💬 Comment draft (code block — easy to copy)
+- ✍️ Content angle for your own posts
+- 📊 Meta: score, type, engagement, timestamp
+
+---
+
+## Notion Setup
+
+```
+1. notion.so/my-integrations → New Integration → "LinkedIn Agent" → Submit
+2. Copy "Internal Integration Secret" → NOTION_TOKEN in .env
+3. Create an empty Notion page (anywhere)
+4. URL: notion.so/workspace/My-Page-abc123def456...
+   Copy the last 32 chars → NOTION_PARENT_PAGE_ID in .env
+5. On that page → ··· menu → Connections → Add "LinkedIn Agent"
+```
+
+---
+
+## LLM Setup
+
+| Provider | Free Tier | Get Key |
+|----------|-----------|---------|
+| Gemini Flash | 1M tokens/day | aistudio.google.com/apikey |
+| Groq | Rate limited | console.groq.com/keys |
+
+Set `GEMINI_API_KEY` or `GROQ_API_KEY` in `.env`.
 
 ---
 
 ## Troubleshooting
 
-**"No posts extracted" / empty raw_posts.json**
+**"No posts extracted"**
+- Check `session/feed_screenshot.png` — see what the browser sees
+- LinkedIn may have updated their DOM selectors
+- Run `python agent.py --extract-only` to test just extraction
 
-LinkedIn changed their DOM. Run the screenshot fallback test:
-```bash
-python feed_extractor.py
-```
-Check `session/feed_screenshot.png` to see what the agent sees.
+**"Gemini rate limit"**
+- Free tier: 15 req/min. Retry handles this automatically with 60s wait.
+- Reduce `POSTS_TO_COLLECT` or add `GEMINI_API_KEY` from paid account
 
-**"Login failed"**
-
-Check your `.env` credentials. If 2FA is on for your LinkedIn, disable it temporarily or use app password.
+**"Notion 403 error"**
+- Check you've shared the page with your integration (step 5 of Notion setup)
+- Delete `session/notion_db_id.txt` and re-run to recreate the database
 
 **Cookies expired**
-
-Delete `session/linkedin_cookies.json` and run again - it will re-login.
-
-**ModuleNotFoundError: browser_use**
-
-```bash
-pip install browser-use
-```
+- Delete `session/linkedin_cookies.json` — agent will re-login automatically
 
 ---
 
-## LLM Options (Day 2+)
+## Interest Profile
 
-You'll need one of these for AI analysis (free tiers available):
-
-| Provider | Free Tier | Speed | Notes |
-|----------|-----------|-------|-------|
-| **Gemini Flash** | ✓ 1M tokens/day | Fast | Recommended |
-| **Groq** | ✓ Rate limited | Very fast | Llama/Mixtral |
-| **Ollama** | ✓ Unlimited | Slow (local) | No internet needed |
-
-Get Gemini API key (free): https://aistudio.google.com/apikey
-
----
-
-## What's Coming
-
-- **Day 2:** Gemini interest-matching — does this post relate to LangGraph / RAG / agentic AI?
-- **Day 3:** Relevance scoring + comment draft generation
-- **Day 4:** Notion save integration
-- **Day 5:** End-to-end pipeline
+Edit `AKSH_INTEREST_PROFILE` in `analyzer.py` to tune what gets saved.
+Current interests: LangGraph, Google ADK, RAG pipelines, agentic AI,
+vector DBs, AI observability, browser agents, LLM deployment, AI engineering.
