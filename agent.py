@@ -53,6 +53,8 @@ Examples:
     parser.add_argument("--test-notion",   action="store_true", help="Test Notion connection and exit")
     parser.add_argument("--view-saved",    action="store_true", help="Pretty-print last analyzed posts")
     parser.add_argument("--clear-seen",    action="store_true", help="Reset dedup store")
+    parser.add_argument("--generate-posts",action="store_true", help="Generate LinkedIn drafts from saved angles")
+    parser.add_argument("--setup-check",   action="store_true", help="Validate entire environment")
     parser.add_argument("--posts", type=int, default=None, help="Override POSTS_TO_COLLECT")
     parser.add_argument("--threshold", type=int, default=7, help="Min score to save (default: 7)")
     return parser.parse_args()
@@ -311,6 +313,16 @@ async def main():
 
     if args.test_notion:
         cmd_test_notion()
+        return
+
+    if args.setup_check:
+        import setup_check
+        setup_check.main()
+        return
+
+    if args.generate_posts:
+        import post_generator
+        post_generator.main()
         return
 
     # ── Pipeline ──────────────────────────────────────────────────────────────
