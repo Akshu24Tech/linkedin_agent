@@ -19,7 +19,7 @@ from typing import Optional
 from dotenv import load_dotenv
 
 from schemas import PostAnalysis
-from feed_extractor import RawPost
+from schemas import RawPost
 
 load_dotenv()
 

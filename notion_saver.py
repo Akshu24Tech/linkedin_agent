@@ -24,7 +24,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 
 from schemas import PostAnalysis
-from feed_extractor import RawPost
+from schemas import RawPost
 
 load_dotenv()
 
@@ -432,7 +432,7 @@ def main():
     Test Notion saving with mock data - no LinkedIn or Gemini needed.
     Make sure NOTION_TOKEN and NOTION_PARENT_PAGE_ID are set in .env
     """
-    from feed_extractor import RawPost
+    from schemas import RawPost
     from schemas import PostAnalysis
 
     print("=" * 55)

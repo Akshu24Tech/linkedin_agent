@@ -127,3 +127,27 @@ class PostAnalysis(BaseModel):
             "If relevant and saved, write: 'Saved.'"
         )
     )
+
+from dataclasses import dataclass, asdict
+from pathlib import Path
+import json
+
+@dataclass
+class RawPost:
+    post_id: str
+    author_name: str
+    author_headline: str
+    post_text: str
+    post_url: str
+    has_image: bool
+    has_video: bool
+    likes_approx: str
+    comments_approx: str
+    extracted_at: str
+    screenshot_path: str
+
+def save_raw_posts(posts: list[RawPost], path: str = "session/raw_posts.json") -> None:
+    Path("session").mkdir(exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump([asdict(p) for p in posts], f, indent=2, ensure_ascii=False)
+
