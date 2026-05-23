@@ -60,29 +60,25 @@ def parse_args():
 # ── One-shot commands ─────────────────────────────────────────────────────────
 
 def cmd_stats():
-    from dedup_store import stats as dedup_stats
-    from profiles import load_profiles, print_profiles_table
+    from memory import stats as mem_stats, get_all_persons, print_persons_table
 
-    ds = dedup_stats()
-    print("\n" + "═"*55)
+    s = mem_stats()
+    print("\n" + "="*55)
     print("  Agent Stats")
-    print("═"*55)
-    print(f"  Posts seen (dedup):  {ds['total_seen']}")
-    print(f"  Last updated:        {ds['last_updated']}")
+    print("="*55)
+    print(f"  Memory DB:           session/memory.db")
+    print(f"  Posts seen (total):  {s['total_seen']}")
+    print(f"  Posts saved:         {s['total_saved']}")
+    print(f"  Persons tracked:     {s['total_persons']}")
+    last = s['last_updated']
+    print(f"  Last activity:       {last[:16] if last != 'never' else 'never'}")
     print(f"  Log file:            {LOG_FILE}")
-
-    if Path("session/analyzed_posts.json").exists():
-        with open("session/analyzed_posts.json") as f:
-            data = json.load(f)
-        saved = [d for d in data if d["analysis"]["should_save"] and d["analysis"]["relevance_score"] >= 7]
-        print(f"  Last run:            {len(data)} analyzed, {len(saved)} saved")
 
     if Path("session/notion_db_id.txt").exists():
         db_id = Path("session/notion_db_id.txt").read_text().strip()
         print(f"  Notion DB:           {db_id[:8]}...{db_id[-4:]}")
 
-    profiles = load_profiles()
-    print_profiles_table(profiles)
+    print_persons_table(get_all_persons())
 
 
 def cmd_view_saved():
@@ -96,28 +92,28 @@ def cmd_view_saved():
 
     saved = [d for d in data if d["analysis"]["should_save"] and d["analysis"]["relevance_score"] >= 7]
 
-    print(f"\n{'═'*60}")
+    print(f"\n{'='*60}")
     print(f"  Saved Posts ({len(saved)} from last run)")
-    print(f"{'═'*60}")
+    print(f"{'='*60}")
 
     for i, item in enumerate(saved, 1):
         p = item["post"]
         a = item["analysis"]
-        score_bar = "█" * a["relevance_score"] + "░" * (10 - a["relevance_score"])
+        score_bar = "#" * a["relevance_score"] + "." * (10 - a["relevance_score"])
         print(f"\n[{i}] {p['author_name']}  [{score_bar}] {a['relevance_score']}/10")
         print(f"\n     SUMMARY:")
         print(f"     {a['post_summary']}")
-        print(f"\n     💡 INSIGHT:")
+        print(f"\n     [Insight] INSIGHT:")
         print(f"     {a['key_insight']}")
         if a["comment_draft"]:
-            print(f"\n     💬 COMMENT DRAFT:")
+            print(f"\n     [Comment Draft] COMMENT DRAFT:")
             print(f"     {a['comment_draft']}")
         if a["content_angle"]:
-            print(f"\n     ✍️  CONTENT ANGLE:")
+            print(f"\n     [Content Angle] CONTENT ANGLE:")
             print(f"     {a['content_angle']}")
         if p["post_url"]:
-            print(f"\n     🔗 {p['post_url'][:80]}")
-        print("\n     " + "─"*55)
+            print(f"\n     [URL] {p['post_url'][:80]}")
+        print("\n     " + "-"*55)
 
     if not saved:
         print("\n  No posts met save threshold in last run.")
@@ -125,28 +121,28 @@ def cmd_view_saved():
 
 
 def cmd_clear_seen():
-    p = Path("session/seen_posts.json")
-    if p.exists():
-        p.unlink()
-        print("[✓] Dedup store cleared.")
-    else:
-        print("[i] Already empty.")
+    from memory import get_db
+    with get_db() as conn:
+        count = conn.execute("SELECT COUNT(*) FROM posts").fetchone()[0]
+        conn.execute("DELETE FROM posts")
+        conn.execute("DELETE FROM analyses")
+    print(f"[OK] Cleared {count} posts from memory.db. Everything re-analyzed next run.")
 
 
 def cmd_test_notion():
     from notion_saver import get_or_create_database, get_headers
     import requests
-    print("\n[→] Testing Notion...")
+    print("\n[->] Testing Notion...")
     try:
         res = requests.get("https://api.notion.com/v1/users/me", headers=get_headers())
         if res.status_code == 200:
-            print(f"[✓] Auth OK — {res.json().get('name', 'Unknown')}")
+            print(f"[OK] Auth OK - {res.json().get('name', 'Unknown')}")
             db_id = get_or_create_database()
-            print(f"[✓] Database ready: {db_id[:8]}...{db_id[-4:]}")
+            print(f"[OK] Database ready: {db_id[:8]}...{db_id[-4:]}")
         else:
-            print(f"[✗] Auth failed: {res.status_code}")
+            print(f"[X] Auth failed: {res.status_code}")
     except Exception as e:
-        print(f"[✗] {e}")
+        print(f"[X] {e}")
 
 
 # ── Pipeline steps ────────────────────────────────────────────────────────────
@@ -158,17 +154,51 @@ async def step_extract() -> list:
 
 
 def step_analyze(posts: list, threshold: int = 7) -> tuple[list, list]:
-    from dedup_store import filter_new_posts, mark_posts_seen
-    from analyzer import analyze_posts_batch, filter_saved_posts
+    from memory import (
+        filter_new_posts, mark_posts_seen,
+        mark_post_analyzed, update_person_after_run, name_to_username,
+    )
+    from analyzer import analyze_posts_batch
+    from collections import defaultdict
 
     new_posts, skipped = filter_new_posts(posts)
     if not new_posts:
-        log.info("[analyze] All posts already seen.")
+        log.info("[analyze] All posts already seen — zero tokens used.")
         return [], []
 
-    log.info(f"[analyze] {len(new_posts)} new posts to analyze ({skipped} already seen)")
+    log.info(f"[analyze] {len(new_posts)} new posts | {skipped} skipped (cached/seen)")
     all_results = analyze_posts_batch(new_posts, delay_between=1.5)
     mark_posts_seen(new_posts)
+
+    # Aggregate scores + topics per person, update memory.db
+    person_scores: dict = defaultdict(list)
+    person_topics: dict = defaultdict(list)
+    person_saved: dict = defaultdict(int)
+
+    for post, analysis in all_results:
+        username = name_to_username(post.author_name)
+        person_scores[username].append(analysis.relevance_score)
+        person_topics[username].extend(analysis.matched_interests)
+        is_saved = (
+            analysis.is_relevant
+            and analysis.relevance_score >= threshold
+            and analysis.should_save
+        )
+        if is_saved:
+            person_saved[username] += 1
+        mark_post_analyzed(post.post_id, analysis.relevance_score, is_saved)
+
+    for username in set(person_scores.keys()):
+        try:
+            update_person_after_run(
+                username=username,
+                posts_seen=len(person_scores[username]),
+                posts_saved=person_saved[username],
+                scores=person_scores[username],
+                topics=person_topics[username],
+            )
+        except Exception as e:
+            log.warning(f"[memory] Stats update failed for {username}: {e}")
 
     saved = [
         (p, a) for p, a in all_results
@@ -190,7 +220,7 @@ def step_persist_json(all_results: list) -> None:
 
 
 def load_raw_posts_from_json() -> list:
-    from schemas import RawPost
+    from schemas import RawPost  # RawPost is defined in schemas.py
     path = Path("session/raw_posts.json")
     if not path.exists():
         log.error("session/raw_posts.json not found. Run extraction first.")
@@ -205,23 +235,23 @@ def load_raw_posts_from_json() -> list:
 def print_summary(all_results, saved_posts, notion_count, dry_run=False):
     total = len(all_results)
     saved = len(saved_posts)
-    print("\n" + "═"*60)
+    print("\n" + "="*60)
     print(f"  RUN COMPLETE  {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    print("═"*60)
+    print("="*60)
     print(f"  Analyzed:       {total}")
-    print(f"  Relevant (≥7):  {saved}")
+    print(f"  Relevant (>=7): {saved}")
     print(f"  Notion:         {'[dry run]' if dry_run else notion_count}")
-    print("═"*60)
+    print("="*60)
 
     for i, (post, analysis) in enumerate(saved_posts, 1):
-        bar = "█" * analysis.relevance_score + "░" * (10 - analysis.relevance_score)
+        bar = "#" * analysis.relevance_score + "." * (10 - analysis.relevance_score)
         print(f"\n  [{i}] [{bar}] {analysis.relevance_score}/10  {post.author_name}")
         print(f"       {analysis.post_summary[:100]}...")
-        print(f"       💡 {analysis.key_insight[:85]}...")
+        print(f"       [Insight] {analysis.key_insight[:85]}...")
         if analysis.comment_draft:
-            print(f"       💬 Comment ready — run --view-saved to copy")
+            print(f"       [Comment] Comment ready - run --view-saved to copy")
         if analysis.content_angle:
-            print(f"       ✍️  {analysis.content_angle[:70]}...")
+            print(f"       [Angle]   {analysis.content_angle[:70]}...")
 
     if not saved_posts:
         print("\n  No posts met threshold.")
@@ -244,9 +274,10 @@ async def main():
         import post_generator; post_generator.main(); return
 
     # ── Check profiles exist before doing anything ────────────────────────────
-    from profiles import load_profiles
+    from memory import get_all_persons, init_db
+    init_db()
     if not args.analyze_only:
-        profiles = load_profiles()
+        profiles = get_all_persons()
         if not profiles:
             print("\n[!] No profiles tracked yet. Add some first:")
             print('    python profiles.py add "Harrison Chase"')
@@ -255,24 +286,24 @@ async def main():
             print()
             return
 
-    print("\n" + "═"*60)
+    print("\n" + "="*60)
     print("  LinkedIn Feed Intelligence Agent")
-    print("  Profile-based extraction → Gemini analysis → Notion")
-    print("═"*60)
+    print("  Profile-based extraction -> Gemini analysis -> Notion")
+    print("="*60)
 
     # ── Extract ───────────────────────────────────────────────────────────────
     if args.analyze_only:
         print("\n[STEP 1] Loading from session/raw_posts.json")
-        print("─"*42)
+        print("-"*42)
         posts = load_raw_posts_from_json()
     else:
         print(f"\n[STEP 1] Extracting from {len(profiles)} profiles")
-        print("─"*42)
+        print("-"*42)
         try:
             posts = await step_extract()
         except Exception as e:
             log.error(f"[extract] {e}")
-            print(f"\n[✗] Extraction failed: {e}")
+            print(f"\n[X] Extraction failed: {e}")
             sys.exit(1)
 
         if not posts:
@@ -282,17 +313,17 @@ async def main():
             return
 
     if args.extract_only:
-        print(f"\n[✓] Extracted {len(posts)} posts → session/raw_posts.json")
+        print(f"\n[OK] Extracted {len(posts)} posts -> session/raw_posts.json")
         return
 
     # ── Analyze ───────────────────────────────────────────────────────────────
     print(f"\n[STEP 2] AI Analysis ({len(posts)} posts)")
-    print("─"*42)
+    print("-"*42)
     try:
         all_results, saved_posts = step_analyze(posts, threshold=args.threshold)
     except Exception as e:
         log.error(f"[analyze] {e}")
-        print(f"\n[✗] Analysis failed: {e}")
+        print(f"\n[X] Analysis failed: {e}")
         sys.exit(1)
 
     if not all_results:
@@ -305,7 +336,7 @@ async def main():
     notion_count = 0
     if not args.dry_run:
         print(f"\n[STEP 3] Saving to Notion")
-        print("─"*42)
+        print("-"*42)
         try:
             notion_count = step_save_notion(all_results)
         except Exception as e:

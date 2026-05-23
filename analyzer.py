@@ -3,11 +3,11 @@ analyzer.py
 ───────────
 The AI brain of the agent.
 
-Takes raw extracted posts -> runs Gemini Flash structured analysis ->
+Takes raw extracted posts → runs Gemini Flash structured analysis →
 returns PostAnalysis objects with interest scores, insights, comment drafts.
 
 Uses Gemini's native JSON schema mode for guaranteed structured output.
-No regex parsing, no prompt hacks - pure Pydantic.
+No regex parsing, no prompt hacks — pure Pydantic.
 
 Supports Gemini (primary) and Groq (fallback).
 """
@@ -25,16 +25,16 @@ load_dotenv()
 
 
 # ── Interest Profile ──────────────────────────────────────────────────────────
-# This is Akshu's interest fingerprint - what the agent filters for.
+# This is Aksh's interest fingerprint — what the agent filters for.
 # Edit this to tune what gets saved vs skipped.
 
-AKSHU_INTEREST_PROFILE = """
-You are analyzing LinkedIn posts for Akshu Grewal (Akshu), a final-year B.Tech CSE (AI) 
+AKSH_INTEREST_PROFILE = """
+You are analyzing LinkedIn posts for Akshu Grewal (Aksh), a final-year B.Tech CSE (AI) 
 student and AI engineer building production-grade agentic systems.
 
 His CORE INTEREST AREAS (save posts about these):
-- LangGraph: state machines,w r checkpointing, human-in-the-loop, multi-agent graphs
-- LangChain: agents, tools, chains, neeleases/features
+- LangGraph: state machines, checkpointing, human-in-the-loop, multi-agent graphs
+- LangChain: agents, tools, chains, new releases/features
 - Google ADK (Agent Development Kit): tutorials, patterns, production use
 - Gemini API: new features, fine-tuning, multimodal use, deployment
 - Agentic AI systems: orchestration, planning, memory, tool use, reflection
@@ -78,7 +78,7 @@ Engagement: {likes} likes, {comments} comments
 ─────────────────────────────────────────
 
 Analyze this post and fill in the structured output schema.
-Be strict on relevance - it's better to skip a borderline post than save noise.
+Be strict on relevance — it's better to skip a borderline post than save noise.
 For comment drafts, write like a practitioner who has actually built these systems,
 not like someone trying to network. Avoid platitudes.
 """
@@ -94,9 +94,9 @@ def get_llm():
 
     if gemini_key and gemini_key != "your_gemini_api_key_here":
         from langchain_google_genai import ChatGoogleGenerativeAI
-        print("[i] Using Gemini 2.5 Flash for analysis")
+        print("[i] Using Gemini 2.0 Flash for analysis")
         return ChatGoogleGenerativeAI(
-            model="gemini-2.5-flash",
+            model="gemini-2.0-flash",
             google_api_key=gemini_key,
             temperature=0.1,  # Low temp = consistent, structured responses
         )
@@ -122,7 +122,7 @@ def get_llm():
 def build_structured_analyzer(llm):
     """
     Wrap the LLM with structured output using PostAnalysis schema.
-    Uses json_schema mode - Gemini guarantees valid Pydantic output.
+    Uses json_schema mode — Gemini guarantees valid Pydantic output.
     """
     return llm.with_structured_output(
         schema=PostAnalysis,
@@ -133,7 +133,7 @@ def build_structured_analyzer(llm):
 def build_prompt(post: RawPost) -> str:
     """Build the analysis prompt for a single post."""
     return ANALYSIS_PROMPT_TEMPLATE.format(
-        interest_profile=AKSHU_INTEREST_PROFILE,
+        interest_profile=AKSH_INTEREST_PROFILE,
         author_name=post.author_name,
         author_headline=post.author_headline or "N/A",
         post_text=post.post_text[:2000],  # Cap at 2000 chars to save tokens
@@ -145,22 +145,62 @@ def build_prompt(post: RawPost) -> str:
 def analyze_post(analyzer, post: RawPost) -> Optional[PostAnalysis]:
     """
     Analyze a single post with Gemini.
-    Returns PostAnalysis or None if analysis fails.
+    1. Check memory.db cache first — if already analyzed, return cached result (zero tokens)
+    2. If new — call Gemini, save result to DB, return
+    Uses retry with exponential backoff for rate limits.
     """
     if not post.post_text or len(post.post_text) < 30:
         return None
 
-    # Skip screenshot placeholder
     if post.post_id == "screenshot_mode":
         return None
 
+    # ── Cache check — saves tokens completely ────────────────────────────────
+    try:
+        from memory import get_cached_analysis
+        cached = get_cached_analysis(post.post_id)
+        if cached:
+            print(f"    [cache] Using stored analysis (0 tokens)")
+            import json
+            return PostAnalysis(
+                is_relevant=bool(cached["is_relevant"]),
+                relevance_score=cached["relevance_score"],
+                matched_interests=json.loads(cached["matched_topics"] or "[]"),
+                post_summary=cached["post_summary"] or "",
+                key_insight=cached["key_insight"] or "",
+                content_type=cached["content_type"] or "other",
+                should_comment=bool(cached["should_comment"]),
+                comment_draft=cached["comment_draft"] or "",
+                should_save=bool(cached["should_save"]),
+                content_angle=cached["content_angle"] or "",
+                skip_reason=cached["skip_reason"] or "",
+            )
+    except Exception:
+        pass  # cache miss or DB error — proceed to Gemini
+
+    # ── Call Gemini ───────────────────────────────────────────────────────────
+    from retry import with_retry
     prompt = build_prompt(post)
 
     try:
-        result = analyzer.invoke(prompt)
+        result = with_retry(
+            lambda: analyzer.invoke(prompt),
+            retries=3,
+            base_delay=5.0,
+            label=f"Gemini/{post.author_name[:20]}",
+        )
+
+        # Save to DB so we never call Gemini on this post again
+        try:
+            from memory import save_analysis
+            save_analysis(post.post_id, result)
+        except Exception:
+            pass  # DB save failure shouldn't stop the pipeline
+
         return result
+
     except Exception as e:
-        print(f"    [!] Analysis failed for post by {post.author_name}: {e}")
+        print(f"    [!] Analysis failed for {post.author_name}: {e}")
         return None
 
 
@@ -170,7 +210,7 @@ def analyze_posts_batch(
 ) -> list[tuple[RawPost, PostAnalysis]]:
     """
     Analyze a batch of posts.
-    Returns list of (post, analysis) tuples - only for analyzed posts.
+    Returns list of (post, analysis) tuples — only for analyzed posts.
 
     Args:
         posts: Raw extracted posts from feed_extractor
@@ -186,18 +226,52 @@ def analyze_posts_batch(
     print(f"\n[->] Analyzing {len(posts)} posts with AI...")
     print(f"    Threshold: score >= 7 gets saved\n")
 
+    # Import memory here to avoid circular imports
+    try:
+        from memory import get_cached_analysis, save_analysis, mark_post_analyzed
+        use_memory = True
+    except ImportError:
+        use_memory = False
+
     for i, post in enumerate(posts, 1):
         print(f"  [{i}/{len(posts)}] {post.author_name[:35]!r}")
+
+        # Check memory cache first — skip Gemini call if already analyzed
+        if use_memory:
+            cached = get_cached_analysis(post.post_id)
+            if cached:
+                print(f"         -> Cached (score {cached['relevance_score']}/10, no Gemini call)")
+                # Reconstruct PostAnalysis from cached data
+                import json
+                analysis = PostAnalysis(
+                    is_relevant=bool(cached["is_relevant"]),
+                    relevance_score=cached["relevance_score"],
+                    matched_interests=json.loads(cached["matched_topics"] or "[]"),
+                    post_summary=cached["post_summary"] or "",
+                    key_insight=cached["key_insight"] or "",
+                    content_type=cached["content_type"] or "other",
+                    should_comment=bool(cached["should_comment"]),
+                    comment_draft=cached["comment_draft"] or "",
+                    should_save=bool(cached["should_save"]),
+                    content_angle=cached["content_angle"] or "",
+                    skip_reason=cached["skip_reason"] or "",
+                )
+                results.append((post, analysis))
+                if analysis.should_save:
+                    saved_count += 1
+                else:
+                    skipped_count += 1
+                continue
 
         analysis = analyze_post(analyzer, post)
 
         if analysis is None:
-            print(f"         Skipped (no content / extraction failed)")
+            print(f"         -> Skipped (no content / extraction failed)")
             skipped_count += 1
             continue
 
         # Log the decision
-        score_bar = "█" * analysis.relevance_score + "░" * (10 - analysis.relevance_score)
+        score_bar = "#" * analysis.relevance_score + "." * (10 - analysis.relevance_score)
         status = "SAVE" if analysis.should_save else "skip"
 
         print(f"         Score: [{score_bar}] {analysis.relevance_score}/10  {status}")
@@ -206,7 +280,7 @@ def analyze_posts_batch(
             print(f"         Topics: {', '.join(analysis.matched_interests)}")
             print(f"         Insight: {analysis.key_insight[:80]}...")
             if analysis.should_comment:
-                print(f"         Comment drafted")
+                print(f"         Comment drafted [OK]")
             saved_count += 1
         else:
             print(f"         Reason: {analysis.skip_reason}")
@@ -214,11 +288,23 @@ def analyze_posts_batch(
 
         results.append((post, analysis))
 
-        # Rate limit safety - Gemini free tier = 15 req/min
+        # Save to memory — prevents re-analyzing same post ever again
+        if use_memory:
+            try:
+                save_analysis(post.post_id, analysis)
+                mark_post_analyzed(
+                    post.post_id,
+                    score=analysis.relevance_score,
+                    saved=analysis.should_save,
+                )
+            except Exception:
+                pass  # Memory save failing should never break the pipeline
+
+        # Rate limit safety — Gemini free tier = 15 req/min
         if i < len(posts):
             time.sleep(delay_between)
 
-    print(f"\n Analysis complete: {saved_count} saved, {skipped_count} skipped out of {len(posts)} posts")
+    print(f"\n[OK] Analysis complete: {saved_count} saved, {skipped_count} skipped out of {len(posts)} posts")
     return results
 
 
@@ -326,7 +412,7 @@ def main():
     print(f"{'='*55}")
 
     for post, analysis in saved:
-        print(f"\n  {post.author_name}")
+        print(f"\n  - {post.author_name}")
         print(f"     Score:    {analysis.relevance_score}/10")
         print(f"     Topics:   {', '.join(analysis.matched_interests)}")
         print(f"     Summary:  {analysis.post_summary}")
@@ -349,7 +435,7 @@ def main():
 
     with open("session/analyzed_posts.json", "w") as f:
         json.dump(output, f, indent=2, ensure_ascii=False)
-    print(f"\n[v] Full results saved to session/analyzed_posts.json")
+    print(f"\n[OK] Full results saved to session/analyzed_posts.json")
 
 
 if __name__ == "__main__":

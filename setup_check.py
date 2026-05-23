@@ -5,13 +5,14 @@ Validates your entire environment before running the agent.
 Run this ONCE after cloning / setting up .env.
 
 Checks:
-  ✓ Python version
-  ✓ All required packages installed
-  ✓ .env file exists with all keys filled
-  ✓ Gemini API key works (test call)
-  ✓ Notion token + page ID work
-  ✓ Playwright + Chromium installed
-  ✓ Session folder writable
+  - Python version
+  - All required packages installed
+  - .env file exists with all keys filled
+  - Gemini API key works (test call)
+  - Notion token + page ID work
+  - Playwright + Chromium installed
+  - Session folder writable
+  - Memory Database active
 
 Run:
   python setup_check.py
@@ -22,12 +23,12 @@ import os
 import subprocess
 from pathlib import Path
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Helpers (ASCII only for Windows compatibility) ────────────────────────────
 
-PASS = "\033[32m✓\033[0m"
-FAIL = "\033[31m✗\033[0m"
-WARN = "\033[33m!\033[0m"
-INFO = "\033[90m·\033[0m"
+PASS = "[OK]"
+FAIL = "[X]"
+WARN = "[!]"
+INFO = "-"
 
 errors = []
 warnings = []
@@ -41,25 +42,25 @@ def check(label: str, ok: bool, detail: str = "", fix: str = ""):
     else:
         print(f"  {FAIL}  {label}")
         if detail:
-            print(f"     \033[31m{detail}\033[0m")
+            print(f"     {detail}")
         if fix:
-            print(f"     \033[33mFix: {fix}\033[0m")
+            print(f"     Fix: {fix}")
         errors.append(label)
 
 
 def warn(label: str, detail: str = "", fix: str = ""):
     print(f"  {WARN}  {label}")
     if detail:
-        print(f"     \033[33m{detail}\033[0m")
+        print(f"     {detail}")
     if fix:
-        print(f"     Fix: {fix}\033[0m")
+        print(f"     Fix: {fix}")
     warnings.append(label)
 
 
 def section(title: str):
-    print(f"\n  {'─'*45}")
+    print(f"\n  {'-'*45}")
     print(f"  {title}")
-    print(f"  {'─'*45}")
+    print(f"  {'-'*45}")
 
 
 # ── Checks ────────────────────────────────────────────────────────────────────
@@ -86,7 +87,7 @@ def check_packages():
         "google.generativeai": "google-generativeai",
     }
     optional = {
-        "langchain_groq": "langchain-groq (optional — Groq fallback)",
+        "langchain_groq": "langchain-groq (optional - Groq fallback)",
     }
 
     for module, pkg in required.items():
@@ -94,14 +95,14 @@ def check_packages():
             __import__(module)
             check(pkg, True)
         except ImportError:
-            check(pkg, False, fix=f"pip install {pkg.split(' ')[0]}")
+            check(pkg, False, fix=f"pip install {pkg}")
 
     for module, label in optional.items():
         try:
             __import__(module)
             check(label, True)
         except ImportError:
-            warn(label, "Not installed — only needed if using Groq instead of Gemini")
+            warn(label, "Not installed - only needed if using Groq instead of Gemini")
 
 
 def check_playwright():
@@ -109,7 +110,7 @@ def check_playwright():
     try:
         result = subprocess.run(
             ["playwright", "install", "--dry-run", "chromium"],
-            capture_output=True, text=True
+            capture_output=True, text=True, shell=True
         )
         # If chromium is installed, dry-run output mentions it
         installed = "chromium" in result.stdout.lower() or result.returncode == 0
@@ -173,7 +174,7 @@ def check_env():
     if groq_key and groq_key not in placeholder_values:
         check("Groq API key (optional)", True)
     else:
-        print(f"  {INFO}  Groq API key — not set (optional, Gemini is primary)")
+        print(f"  {INFO}  Groq API key - not set (optional, Gemini is primary)")
 
 
 def check_gemini():
@@ -266,7 +267,7 @@ def check_notion():
         elif res.status_code == 404:
             check("Notion page access", False,
                   detail="Page not found or integration not connected",
-                  fix="On that Notion page: ··· → Connections → Add your integration")
+                  fix="On that Notion page: ... -> Connections -> Add your integration")
         else:
             check("Notion page access", False, detail=f"Status {res.status_code}: {res.text[:80]}")
     except Exception as e:
@@ -284,16 +285,29 @@ def check_filesystem():
     except Exception as e:
         check("session/ folder writable", False, detail=str(e))
 
-    check(".env.example exists", Path(".env.example").exists())
+    check("env.example exists", Path("env.example").exists() or Path(".env.example").exists())
     check("requirements.txt exists", Path("requirements.txt").exists())
+
+
+def check_database():
+    section("Memory Database")
+    try:
+        from memory import init_db, get_db
+        init_db()
+        with get_db() as conn:
+            persons_count = conn.execute("SELECT COUNT(*) FROM persons").fetchone()[0]
+            posts_count = conn.execute("SELECT COUNT(*) FROM posts").fetchone()[0]
+        check("Memory DB initialization", True, detail=f"Database active. Persons: {persons_count}, Posts: {posts_count}")
+    except Exception as e:
+        check("Memory DB initialization", False, detail=str(e), fix="Check memory.py schema definitions")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    print("\n" + "═"*50)
-    print("  LinkedIn Feed Agent — Setup Check")
-    print("═"*50)
+    print("\n" + "="*50)
+    print("  LinkedIn Feed Agent - Setup Check")
+    print("="*50)
 
     check_python()
     check_packages()
@@ -302,25 +316,26 @@ def main():
     check_gemini()
     check_notion()
     check_filesystem()
+    check_database()
 
     # ── Result ────────────────────────────────────────────────────────────────
-    print("\n" + "═"*50)
+    print("\n" + "="*50)
 
     if not errors:
-        print(f"  \033[32m✓ All checks passed!\033[0m")
+        print(f"  [OK] All checks passed!")
         print(f"\n  You're good to go. Run:")
-        print(f"    python agent.py --dry-run    ← test run (no Notion write)")
-        print(f"    python agent.py              ← full run")
+        print(f"    python agent.py --dry-run    - test run (no Notion write)")
+        print(f"    python agent.py              - full run")
     else:
-        print(f"  \033[31m✗ {len(errors)} check(s) failed:\033[0m")
+        print(f"  [X] {len(errors)} check(s) failed:")
         for e in errors:
-            print(f"    · {e}")
+            print(f"    - {e}")
         print(f"\n  Fix the above and re-run: python setup_check.py")
 
     if warnings:
-        print(f"\n  \033[33m{len(warnings)} warning(s):\033[0m")
+        print(f"\n  [!] {len(warnings)} warning(s):")
         for w in warnings:
-            print(f"    · {w}")
+            print(f"    - {w}")
 
     print()
 

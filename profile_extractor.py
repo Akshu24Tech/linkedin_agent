@@ -22,7 +22,6 @@ import os
 import asyncio
 import random
 import json
-from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
 from playwright.async_api import async_playwright, Page, Browser
@@ -30,9 +29,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Import RawPost from schemas
+# RawPost and save_raw_posts live in schemas.py
 from schemas import RawPost, save_raw_posts
-from profiles import load_profiles, update_last_checked, build_activity_url
+from profiles import load_profiles, build_activity_url
 from logger import setup_logger
 
 log = setup_logger(__name__)
@@ -95,13 +94,13 @@ async def get_browser():
     Smart browser factory — checks USE_BROWSERBASE in .env and routes to the
     correct provider.
 
-    USE_BROWSERBASE=false (default) → Local Playwright (free, uses session cookies)
-    USE_BROWSERBASE=true            → Browserbase cloud (stealth, CAPTCHA solving)
+    USE_BROWSERBASE=false (default) -> Local Playwright (free, uses session cookies)
+    USE_BROWSERBASE=true            -> Browserbase cloud (stealth, CAPTCHA solving)
     """
-    use_bb = os.getenv("USE_BROWSERBASE", "false").lower() == "true"
+    from browserbase_provider import is_browserbase_enabled
 
-    if use_bb:
-        log.info("[browser] Using Browserbase cloud browser (USE_BROWSERBASE=true)")
+    if is_browserbase_enabled():
+        log.info("[browser] Path B - Browserbase cloud browser (stealth mode)")
         try:
             from browserbase_provider import get_browserbase_browser, check_browserbase_deps
             if not check_browserbase_deps():
@@ -110,16 +109,12 @@ async def get_browser():
                     "BROWSERBASE_PROJECT_ID in .env, and run: pip install browserbase"
                 )
             return await get_browserbase_browser()
-        except ImportError:
-            log.error("[browser] browserbase_provider.py not found. Falling back to local Playwright.")
-            return await get_browser_with_session()
         except Exception as e:
             log.error(f"[browser] Browserbase failed: {e}")
             log.error("[browser] Falling back to local Playwright.")
-            return await get_browser_with_session()
-    else:
-        log.info("[browser] Using local Playwright (USE_BROWSERBASE=false)")
-        return await get_browser_with_session()
+
+    log.info("[browser] Path A - local Playwright (saved cookies)")
+    return await get_browser_with_session()
 
 
 # ── Post Extraction from Profile Page ────────────────────────────────────────
@@ -398,11 +393,24 @@ async def extract_from_all_profiles(
 
     try:
         for i, profile in enumerate(profiles, 1):
-            name = profile["name"]
+            # Support both old JSON ("name") and new memory.db ("display_name") dicts
+            name = profile.get("display_name") or profile.get("name", "Unknown")
             activity_url = profile["activity_url"]
+            username = profile.get("username", "")
 
             log.info(f"\n[{i}/{len(profiles)}] {name}")
             log.info(f"  URL: {activity_url}")
+
+            # ── Skip check (saves browser time + tokens) ─────────────────────
+            if username:
+                try:
+                    from memory import should_skip_person
+                    skip, reason = should_skip_person(username)
+                    if skip:
+                        log.info(f"  -> Skipped: {reason}")
+                        continue
+                except Exception:
+                    pass  # skip check failure → proceed normally
 
             try:
                 # Navigate to activity page
@@ -421,16 +429,28 @@ async def extract_from_all_profiles(
                     page, name, max_posts=max_posts_per_profile
                 )
 
-                log.info(f"  → Extracted {len(posts)} posts")
+                log.info(f"  -> Extracted {len(posts)} posts")
                 for p in posts:
                     log.info(f"     {p.post_text[:80]}...")
 
                 all_posts.extend(posts)
-                update_last_checked(profile["username"], len(posts))
+
+                # Update memory — posts_seen count (full stats updated after analysis)
+                if username:
+                    try:
+                        from memory import update_person_after_run
+                        update_person_after_run(
+                            username=username,
+                            posts_seen=len(posts),
+                            posts_saved=0,
+                            scores=[],
+                            topics=[],
+                        )
+                    except Exception:
+                        pass
 
             except Exception as e:
-                log.error(f"  → Failed: {e}")
-                # Take debug screenshot
+                log.error(f"  -> Failed: {e}")
                 try:
                     await page.screenshot(
                         path=f"session/debug_{name.replace(' ', '_')}.png"
@@ -453,6 +473,8 @@ async def extract_from_all_profiles(
     log.info(f"\n[profiles] Total posts extracted: {len(all_posts)}")
     save_raw_posts(all_posts)
     return all_posts
+
+
 
 
 # ── Async wrapper for agent.py ────────────────────────────────────────────────

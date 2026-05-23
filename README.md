@@ -9,23 +9,27 @@ A personal AI agent that monitors LinkedIn profiles you care about, extracts the
 ## How It Works
 
 ```
-profiles.json  ←  you manage this (add/remove people by name)
-      ↓
-Browser opens LinkedIn (local Playwright OR Browserbase cloud — your choice)
-      ↓
+SQLite memory.db (persons table)  <-  managed via profiles.py / memory.py
+      |
+      v
+Browser opens LinkedIn (local Playwright OR Browserbase cloud - your choice)
+      |
+      v
 Navigates to each person's activity page
-Clicks "see more" → extracts full post text (no truncation)
-Checks post date → skips anything older than 2 weeks
+Clicks "see more" -> extracts full post text (no truncation)
+Checks post date -> skips anything older than 2 weeks
 Gets latest 1-2 posts per profile (checks max 5 containers, stops early)
-      ↓
-Gemini 2.5 Flash analyzes each post:
-  • Is this relevant to my interests? (score 1–10)
+      |
+      v
+Gemini 2.0 Flash analyzes each post:
+  • Is this relevant to my interests? (score 1-10)
   • What's the key insight?
-  • Should I comment? → drafts a comment in my voice
+  • Should I comment? -> drafts a comment in my voice
   • Could this become my own LinkedIn post?
-      ↓
-Score ≥ 7 → saved to Notion with full context
-Score < 7 → skipped, logged, never seen again (dedup)
+      |
+      v
+Score >= 7 -> saved to Notion + recorded in SQLite database
+Score < 7 -> skipped, recorded in SQLite (dedup) for instant lookup
 ```
 
 ---
@@ -35,64 +39,66 @@ Score < 7 → skipped, logged, never seen again (dedup)
 ```
 linkedin_agent/
 │
-├── agent.py                  ← Main entry point. All commands live here.
+├── agent.py                  - Main entry point. All commands live here.
 │
-├── profile_extractor.py      ← Core scraper. Opens LinkedIn, navigates to
+├── profile_extractor.py      - Core scraper. Opens LinkedIn, navigates to
 │                               each profile's activity page, clicks "see more",
 │                               filters by 2-week date window,
 │                               extracts latest posts per person.
 │                               Routes to local Playwright OR Browserbase
 │                               based on USE_BROWSERBASE in .env.
 │
-├── browserbase_provider.py   ← Browserbase cloud browser (Path B).
+├── browserbase_provider.py   - Browserbase cloud browser (Path B).
 │                               Stealth mode, CAPTCHA solving, persistent
 │                               LinkedIn session via Contexts API.
 │                               Only used when USE_BROWSERBASE=true.
 │
-├── profiles.py               ← Manage your profile watchlist.
-│                               Add/remove people by name — URL auto-built.
+├── memory.py                 - SQLite-backed memory core. Automatically creates and
+│                               manages the database, handles migrations, and
+│                               provides high-performance querying for profiles/posts/analyses.
 │
-├── analyzer.py               ← AI brain. Sends each post to Gemini with your
+├── profiles.py               - Manage your profile watchlist. Wrapper over memory.py
+│                               supporting CLI and backward-compatible CRUD.
+│
+├── analyzer.py               - AI brain. Sends each post to Gemini with your
 │                               interest profile. Returns structured analysis:
 │                               score, insight, comment draft, content angle.
 │
-├── schemas.py                ← Pydantic model for Gemini's structured output.
+├── schemas.py                - Pydantic model for Gemini's structured output.
 │                               Also defines RawPost dataclass and save_raw_posts.
 │
-├── notion_saver.py           ← Saves relevant posts to Notion. Auto-creates
+├── notion_saver.py           - Saves relevant posts to Notion. Auto-creates
 │                               the database on first run. Deduplicates by URL.
 │                               Rich page: summary, insight, comment, angle.
 │
-├── linkedin_login.py         ← Handles LinkedIn auth via Playwright.
+├── linkedin_login.py         - Handles LinkedIn auth via Playwright.
 │                               Saves cookies so browser only opens once.
 │                               Validates li_at + JSESSIONID are present.
 │
-├── dedup_store.py            ← Cross-run memory. Tracks every post ID + URL
-│                               seen. Skips already-analyzed posts instantly.
+├── dedup_store.py            - Backward-compatibility seen-posts wrapper over memory.py.
 │
-├── retry.py                  ← Exponential backoff for all API calls.
-│                               Gemini rate limits → 60s auto-wait.
+├── retry.py                  - Exponential backoff for all API calls.
+│                               Gemini rate limits -> 60s auto-wait.
 │
-├── logger.py                 ← Structured logging to console + session/agent.log.
+├── logger.py                 - Structured logging to console + session/agent.log.
 │
-├── post_generator.py         ← Turns saved content angles into LinkedIn post
+├── post_generator.py         - Turns saved content angles into LinkedIn post
 │                               drafts using Gemini in your voice.
 │
-├── scheduler.py              ← Runs agent automatically on a schedule.
+├── scheduler.py              - Runs agent automatically on a schedule.
 │                               Daily at set time, or every N hours.
 │
-├── setup_check.py            ← Pre-flight validator. Checks Python version,
+├── setup_check.py            - Pre-flight validator. Checks Python version,
 │                               all packages, Playwright, .env keys, Gemini API,
 │                               Notion access, filesystem. Run this first.
 │
-├── requirements.txt          ← All Python dependencies.
-├── env.example               ← Template for credentials. Copy → .env.
+├── requirements.txt          - All Python dependencies.
+├── env.example               - Template for credentials. Copy -> .env.
 │
-└── session/                  ← Auto-created on first run.
+└── session/                  - Auto-created on first run.
     ├── linkedin_cookies.json     LinkedIn session (Playwright saves this)
     ├── bb_context_id.txt         Browserbase context ID (cloud mode only)
-    ├── profiles.json             Your profile watchlist
-    ├── seen_posts.json           Dedup store (cross-run memory)
+    ├── memory.db                 SQLite database containing persons, posts, and analyses
     ├── raw_posts.json            Last extraction output (debug)
     ├── analyzed_posts.json       Last analysis results (full detail)
     ├── notion_db_id.txt          Cached Notion database ID
@@ -327,26 +333,26 @@ python profiles.py add "Person Name" --username correct-username
 |---|---|
 | Browser automation (local) | Playwright (Python) |
 | Browser automation (cloud) | Browserbase (stealth, CAPTCHA solving) |
-| LLM | Gemini 2.5 Flash (via `langchain-google-genai`) |
+| LLM | Gemini 2.0 Flash (via `langchain-google-genai`) |
 | Structured output | Pydantic + `with_structured_output(method="json_schema")` |
 | Storage | Notion API (via `requests`) |
 | Retry logic | Custom exponential backoff (`retry.py`) |
-| Deduplication | Local JSON store (`dedup_store.py`) |
-| Logging | Python `logging` → file + console |
+| Deduplication | SQLite database core (`memory.py`) |
+| Logging | Python `logging` -> file + console |
 | Scheduling | Python `asyncio` loop / cron |
 
 ---
 
 ## LLM Alternatives
 
-Set in `.env` — Gemini is primary, Groq is fallback:
+Set in `.env` - Gemini is primary, Groq is fallback:
 
 | Provider | Free Tier | Key Variable | Model Used |
 |---|---|---|---|
-| **Gemini Flash** | 1M tokens/day | `GEMINI_API_KEY` | `gemini-2.5-flash` |
+| **Gemini Flash** | 1M tokens/day | `GEMINI_API_KEY` | `gemini-2.0-flash` |
 | **Groq** | Rate limited | `GROQ_API_KEY` | `llama-3.3-70b-versatile` |
 
-To switch to Groq, comment out the Gemini block and uncomment Groq in `analyzer.py → get_llm()`.
+To switch to Groq, comment out the Gemini block and uncomment Groq in `analyzer.py -> get_llm()`.
 
 ---
 
