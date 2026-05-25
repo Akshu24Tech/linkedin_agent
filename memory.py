@@ -26,9 +26,19 @@ Database: session/memory.db (single file, zero server needed)
 
 CLI:
   python memory.py persons list
-  python memory.py persons add "Harrison Chase"
-  python memory.py persons add "Andrej Karpathy" --username karpathy
-  python memory.py persons remove "Harrison Chase"
+
+  # Best — paste full LinkedIn URL (guarantees exact person)
+  python memory.py persons add "https://www.linkedin.com/in/karpathy/"
+  python memory.py persons add "https://www.linkedin.com/in/yann-lecun/" --name "Yann LeCun"
+
+  # Also works — just the username slug from the URL
+  python memory.py persons add "karpathy"
+  python memory.py persons add "yann-lecun" --name "Yann LeCun"
+
+  # Risky — name-only (only safe for unique names)
+  python memory.py persons add --name "Harrison Chase" --username "harrison-chase"
+
+  python memory.py persons remove "karpathy"
   python memory.py posts stats
   python memory.py posts clear-seen
   python memory.py migrate          ← import existing profiles.json + seen_posts.json
@@ -71,13 +81,10 @@ def get_db():
 # ── Schema ────────────────────────────────────────────────────────────────────
 
 def init_db() -> None:
-    """
-    Create tables if they don't exist. Safe to call on every startup.
-    Also handles old DB schemas by adding missing columns via ALTER TABLE.
-    """
+    """Create tables if they don't exist. Safe to call on every startup."""
     with get_db() as conn:
-        # ── Create tables (never fails if they already exist) ─────────────────
         conn.executescript("""
+            -- People you track
             CREATE TABLE IF NOT EXISTS persons (
                 username            TEXT PRIMARY KEY,
                 display_name        TEXT NOT NULL,
@@ -86,33 +93,38 @@ def init_db() -> None:
                 note                TEXT DEFAULT '',
                 added_at            TEXT NOT NULL,
                 last_checked        TEXT,
+
+                -- Intelligence built over time
                 total_runs          INTEGER DEFAULT 0,
                 total_posts_seen    INTEGER DEFAULT 0,
                 total_posts_saved   INTEGER DEFAULT 0,
                 avg_relevance_score REAL DEFAULT 0.0,
-                score_history       TEXT DEFAULT '[]',
-                top_topics          TEXT DEFAULT '[]',
-                is_active           INTEGER DEFAULT 1
+                score_history       TEXT DEFAULT '[]',  -- JSON list of last 10 scores
+                top_topics          TEXT DEFAULT '[]',  -- JSON list of frequent topics
+                is_active           INTEGER DEFAULT 1   -- 0 = paused/removed
             );
 
+            -- Every post ever seen (dedup + history)
             CREATE TABLE IF NOT EXISTS posts (
                 post_id         TEXT PRIMARY KEY,
-                post_url        TEXT DEFAULT '',
-                author_username TEXT DEFAULT '',
-                author_name     TEXT DEFAULT '',
-                post_text       TEXT DEFAULT '',
+                post_url        TEXT,
+                author_username TEXT,
+                author_name     TEXT,
+                post_text       TEXT,
                 extracted_at    TEXT NOT NULL,
-                was_analyzed    INTEGER DEFAULT 0,
-                was_saved       INTEGER DEFAULT 0,
-                relevance_score INTEGER DEFAULT 0
+                was_analyzed    INTEGER DEFAULT 0,  -- 1 if Gemini was called
+                was_saved       INTEGER DEFAULT 0,  -- 1 if saved to Notion
+                relevance_score INTEGER DEFAULT 0,
+                FOREIGN KEY (author_username) REFERENCES persons(username)
             );
 
+            -- Every Gemini analysis result (never re-analyze)
             CREATE TABLE IF NOT EXISTS analyses (
                 post_id         TEXT PRIMARY KEY,
                 analyzed_at     TEXT NOT NULL,
                 is_relevant     INTEGER,
                 relevance_score INTEGER,
-                matched_topics  TEXT,
+                matched_topics  TEXT,   -- JSON list
                 post_summary    TEXT,
                 key_insight     TEXT,
                 content_type    TEXT,
@@ -120,76 +132,64 @@ def init_db() -> None:
                 comment_draft   TEXT,
                 should_save     INTEGER,
                 content_angle   TEXT,
-                skip_reason     TEXT
+                skip_reason     TEXT,
+                FOREIGN KEY (post_id) REFERENCES posts(post_id)
             );
+
+            -- Indexes for fast lookups
+            CREATE INDEX IF NOT EXISTS idx_posts_url
+                ON posts(post_url);
+            CREATE INDEX IF NOT EXISTS idx_posts_author
+                ON posts(author_username);
+            CREATE INDEX IF NOT EXISTS idx_posts_saved
+                ON posts(was_saved);
+            CREATE INDEX IF NOT EXISTS idx_persons_active
+                ON persons(is_active);
         """)
-
-        # ── Rename old columns to new names if they exist ─────────────────────
-        _rename_column_if_exists(conn, "persons", "name", "display_name")
-        _rename_column_if_exists(conn, "persons", "posts_collected", "total_posts_seen")
-        _rename_column_if_exists(conn, "persons", "avg_score", "avg_relevance_score")
-        _rename_column_if_exists(conn, "persons", "topics", "top_topics")
-        _rename_column_if_exists(conn, "analyses", "matched_interests", "matched_topics")
-
-        # ── Add missing columns to existing tables (schema migration) ─────────
-        # This handles old DBs that were created before a column was added.
-        _add_column_if_missing(conn, "persons", "total_runs", "INTEGER DEFAULT 0")
-        _add_column_if_missing(conn, "persons", "total_posts_seen", "INTEGER DEFAULT 0")
-        _add_column_if_missing(conn, "persons", "total_posts_saved", "INTEGER DEFAULT 0")
-        _add_column_if_missing(conn, "persons", "avg_relevance_score", "REAL DEFAULT 0.0")
-        _add_column_if_missing(conn, "persons", "score_history", "TEXT DEFAULT '[]'")
-        _add_column_if_missing(conn, "persons", "top_topics", "TEXT DEFAULT '[]'")
-        _add_column_if_missing(conn, "persons", "is_active", "INTEGER DEFAULT 1")
-
-        _add_column_if_missing(conn, "posts", "author_username", "TEXT DEFAULT ''")
-        _add_column_if_missing(conn, "posts", "author_name",     "TEXT DEFAULT ''")
-        _add_column_if_missing(conn, "posts", "post_text",       "TEXT DEFAULT ''")
-        _add_column_if_missing(conn, "posts", "was_analyzed",    "INTEGER DEFAULT 0")
-        _add_column_if_missing(conn, "posts", "was_saved",       "INTEGER DEFAULT 0")
-        _add_column_if_missing(conn, "posts", "relevance_score", "INTEGER DEFAULT 0")
-
-        # ── Create indexes (each in own try/except — won't fail on old schema) ─
-        for sql in [
-            "CREATE INDEX IF NOT EXISTS idx_posts_url    ON posts(post_url)",
-            "CREATE INDEX IF NOT EXISTS idx_posts_author ON posts(author_username)",
-            "CREATE INDEX IF NOT EXISTS idx_posts_saved  ON posts(was_saved)",
-            "CREATE INDEX IF NOT EXISTS idx_persons_active ON persons(is_active)",
-        ]:
-            try:
-                conn.execute(sql)
-            except Exception:
-                pass  # column may not exist in very old DBs — skip gracefully
-
     log.info(f"[memory] DB ready at {DB_PATH}")
-
-
-def _add_column_if_missing(conn, table: str, column: str, col_def: str) -> None:
-    """Add a column to a table if it doesn't already exist (safe ALTER TABLE)."""
-    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
-    if column not in existing:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_def}")
-        log.info(f"[memory] Schema migration: added {table}.{column}")
-
-
-def _rename_column_if_exists(conn, table: str, old_column: str, new_column: str) -> None:
-    """Rename a column in a table if the old column exists and the new one doesn't."""
-    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
-    if old_column in existing and new_column not in existing:
-        conn.execute(f"ALTER TABLE {table} RENAME COLUMN {old_column} TO {new_column}")
-        log.info(f"[memory] Schema migration: renamed {table}.{old_column} to {new_column}")
-
-
 
 
 # ── URL Helpers ───────────────────────────────────────────────────────────────
 
 def name_to_username(name: str) -> str:
-    """'Andrew Ng' → 'andrew-ng'"""
+    """'Andrew Ng' → 'andrew-ng'  (best-effort only, not guaranteed unique)"""
     slug = name.lower().strip()
     slug = re.sub(r"[^\w\s-]", "", slug)
     slug = re.sub(r"\s+", "-", slug)
     slug = re.sub(r"-+", "-", slug)
     return slug.strip("-")
+
+
+def username_from_url(url: str) -> str | None:
+    """
+    Extract LinkedIn vanity name from any profile URL format.
+
+    Handles all real-world copy-paste formats:
+      https://www.linkedin.com/in/yatinbhalla42?utm_source=share&utm_content=profile&utm_medium=member_android
+      https://linkedin.com/in/karpathy/
+      linkedin.com/in/andrew-ng
+      https://www.linkedin.com/in/yann-lecun/recent-activity/all/
+
+    LinkedIn vanity names are globally unique — no two people share one.
+    Everything after ? is just UTM tracking, safely stripped.
+
+    Returns None if URL doesn't look like a LinkedIn profile URL.
+    """
+    if not url:
+        return None
+
+    url = url.strip()
+
+    # Strip UTM params and everything after ?
+    url = url.split("?")[0]
+
+    # Strip trailing slashes + any sub-paths (like /recent-activity/all/)
+    # We only want the vanity name segment right after /in/
+    match = re.search(r"linkedin[.]com/in/([A-Za-z0-9_-]+)", url)
+    if match:
+        return match.group(1).lower()
+
+    return None
 
 
 def build_activity_url(username: str) -> str:
@@ -202,16 +202,48 @@ def build_profile_url(username: str) -> str:
 
 # ── Persons API ───────────────────────────────────────────────────────────────
 
-def add_person(name: str, username: str = None, note: str = "") -> dict:
+def add_person(name: str, username: str = None, url: str = None, note: str = "") -> dict:
     """
-    Add a person to track. Username auto-derived from name if not given.
-    Returns the person dict.
+    Add a person to track.
+
+    Priority for resolving username:
+      1. --url  "https://linkedin.com/in/karpathy/"  → extracts 'karpathy' (most reliable)
+      2. --username karpathy                          → use exactly as given
+      3. name only "Andrej Karpathy"                 → auto-derive (risky for common names)
+
+    LinkedIn allows duplicate display names — username is the only unique identifier.
+    Always prefer --url or --username for anyone with a common name.
     """
     init_db()
-    if not username:
+
+    # Priority 1: extract from URL (most reliable — copy from their LinkedIn profile)
+    if url:
+        extracted = username_from_url(url)
+        if extracted:
+            username = extracted
+            log.info(f"[memory] Username from URL: '{username}'")
+        else:
+            log.warning(f"[memory] Could not parse username from URL: {url}")
+            log.warning(f"         Expected format: linkedin.com/in/<username>")
+
+    # Priority 2: explicit username provided
+    if not username and url is None:
+        # Auto-derive — warn user to verify
         username = name_to_username(name)
         log.info(f"[memory] Auto-derived username: '{username}'")
-        log.info(f"         If wrong: python memory.py persons add \"{name}\" --username <correct>")
+        log.warning(
+            f"[memory] ⚠ LinkedIn has duplicate names — verify this is the right person:"
+        )
+        log.warning(f"         Open: https://www.linkedin.com/in/{username}/")
+        log.warning(
+            f"         If wrong, re-add with URL: "
+            f"python profiles.py add \"{name}\" --url \"https://linkedin.com/in/<correct-username>/\""
+        )
+    elif not username:
+        # URL was given but parsing failed — fall back to name
+        username = name_to_username(name)
+        log.warning(f"[memory] URL parse failed, falling back to: '{username}'"
+        )
 
     with get_db() as conn:
         # Check duplicate
@@ -236,24 +268,34 @@ def add_person(name: str, username: str = None, note: str = "") -> dict:
             datetime.now().isoformat(),
         ))
 
-    log.info(f"[memory] Added: {name} -> {build_activity_url(username)}")
+    log.info(f"[memory] Added: {name} → {build_activity_url(username)}")
     return get_person(username)
 
 
-def remove_person(name: str) -> bool:
-    """Soft delete — sets is_active=0 so history is preserved."""
+def remove_person(identifier: str) -> bool:
+    """
+    Soft delete — sets is_active=0 so history is preserved.
+    Accepts: username slug, display name, or full LinkedIn URL.
+    """
     init_db()
+
+    # Extract username if URL given
+    if "linkedin.com/in/" in identifier:
+        parsed = username_from_url(identifier)
+        if parsed:
+            identifier = parsed
+
     with get_db() as conn:
-        # Try by display name first, then username
+        # Try exact username match first, then display name
         result = conn.execute(
-            "UPDATE persons SET is_active = 0 WHERE display_name = ? OR username = ?",
-            (name, name_to_username(name))
+            "UPDATE persons SET is_active = 0 WHERE username = ? OR display_name = ?",
+            (identifier, identifier)
         )
         if result.rowcount == 0:
-            log.warning(f"[memory] '{name}' not found")
+            log.warning(f"[memory] '{identifier}' not found in tracked profiles")
             return False
 
-    log.info(f"[memory] Removed: {name} (history preserved)")
+    log.info(f"[memory] Removed: {identifier} (history preserved in DB)")
     return True
 
 
@@ -336,6 +378,27 @@ def update_person_after_run(
             json.dumps(top_topics),
             username,
         ))
+
+
+def reset_verification(username: str) -> None:
+    """
+    Reset checked stats and intelligence history for a person so they
+    are immediately checked on the next run and their history is rebuilt.
+    """
+    init_db()
+    with get_db() as conn:
+        conn.execute("""
+            UPDATE persons SET
+                last_checked        = NULL,
+                total_runs          = 0,
+                total_posts_seen    = 0,
+                total_posts_saved   = 0,
+                avg_relevance_score = 0.0,
+                score_history       = '[]',
+                top_topics          = '[]'
+            WHERE username = ?
+        """, (username,))
+    log.info(f"[memory] Reset verification status and stats for: {username}")
 
 
 def should_skip_person(username: str, min_avg_score: float = 3.0) -> tuple[bool, str]:
@@ -567,7 +630,7 @@ def migrate_from_json() -> None:
                 migrated_posts += 1
         log.info(f"[migrate] Imported {migrated_posts} seen posts from seen_posts.json")
 
-    print(f"\n[OK] Migration complete:")
+    print(f"\n[✓] Migration complete:")
     print(f"    Persons imported: {migrated_persons}")
     print(f"    Posts imported:   {migrated_posts}")
     print(f"    Database:         {DB_PATH}")
@@ -584,9 +647,9 @@ def print_persons_table(persons: list[dict]) -> None:
         print('  Add one: python memory.py persons add "Harrison Chase"')
         return
 
-    print(f"\n  {'-'*62}")
+    print(f"\n  {'─'*62}")
     print(f"  Tracked Profiles ({len(persons)})")
-    print(f"  {'-'*62}")
+    print(f"  {'─'*62}")
 
     for p in persons:
         last = (p.get("last_checked") or "never")[:10]
@@ -594,7 +657,7 @@ def print_persons_table(persons: list[dict]) -> None:
         runs = p.get("total_runs", 0)
         saved = p.get("total_posts_saved", 0)
         topics = json.loads(p.get("top_topics") or "[]")
-        score_bar = ("#" * int(avg) + "." * (10 - int(avg))) if avg else "."*10
+        score_bar = ("█" * int(avg) + "░" * (10 - int(avg))) if avg else "░"*10
 
         print(f"\n  {p['display_name']}")
         print(f"    Username:   {p['username']}")
@@ -606,10 +669,55 @@ def print_persons_table(persons: list[dict]) -> None:
             print(f"    Avg score:  [{score_bar}] {avg:.1f}/10")
         if topics:
             print(f"    Top topics: {', '.join(topics[:5])}")
+
     print()
 
 
+def _cli_add_person(args) -> None:
+    """
+    Smart add — handles URL, username slug, or name gracefully.
+    Called by CLI only.
+    """
+    identifier = args.identifier.strip()
+    name_label = getattr(args, "name", "").strip()
+    username_override = getattr(args, "username", None)
+    note = getattr(args, "note", "")
+
+    # ── Case 1: Full LinkedIn URL ─────────────────────────────────────────────
+    if "linkedin.com/in/" in identifier:
+        username = username_from_url(identifier)
+        if not username:
+            print(f"[✗] Could not parse username from URL: {identifier}")
+            print(f"    Expected format: https://www.linkedin.com/in/<username>/")
+            return
+        display_name = name_label or username  # use --name if given, else slug as label
+        add_person(name=display_name, username=username, note=note)
+        return
+
+    # ── Case 2: Plain username slug (no spaces, no http) ─────────────────────
+    if " " not in identifier and not identifier.startswith("http"):
+        username = username_override or identifier
+        display_name = name_label or identifier
+        add_person(name=display_name, username=username, note=note)
+        return
+
+    # ── Case 3: Display name only (warn user) ─────────────────────────────────
+    print(f"[!] Got a display name: '{identifier}'")
+    print(f"    LinkedIn has many people with the same name.")
+    print(f"    Please use the profile URL instead:")
+    print(f"    1. Open LinkedIn, find the person")
+    print(f"    2. Copy their profile URL from the browser")
+    print(f"    3. Run:")
+    print(f'       python profiles.py add "https://www.linkedin.com/in/<their-username>/"')
+    print()
+    print(f"    If you're sure about the username, use --username:")
+    print(f'       python profiles.py add "{identifier}" --username <their-exact-username>')
+
+
 def main():
+    import sys
+    if sys.platform == "win32":
+        sys.stdout.reconfigure(encoding="utf-8")
     init_db()
 
     parser = argparse.ArgumentParser(
@@ -633,15 +741,43 @@ Examples:
     p_persons = sub.add_parser("persons", help="Manage tracked profiles")
     p_persons_sub = p_persons.add_subparsers(dest="action")
 
-    p_add = p_persons_sub.add_parser("add", help="Add a profile")
-    p_add.add_argument("name", help='Display name e.g. "Harrison Chase"')
-    p_add.add_argument("--username", help="LinkedIn username if auto-derive is wrong")
-    p_add.add_argument("--note", default="", help="Why you're tracking this person")
+    p_add = p_persons_sub.add_parser(
+        "add",
+        help="Add a profile to track",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="""
+Add a LinkedIn profile to track.
+
+BEST: paste their full LinkedIn URL (guarantees the right person)
+  python memory.py persons add "https://www.linkedin.com/in/karpathy/"
+  python memory.py persons add "https://www.linkedin.com/in/andrewyng/" --name "Andrew Ng"
+
+ALSO WORKS: just their username slug (from the URL)
+  python memory.py persons add "karpathy"
+  python memory.py persons add "yann-lecun" --name "Yann LeCun"
+
+RISKY (only for very unique names):
+  python memory.py persons add --name "Someone Unique" --username their-slug
+        """
+    )
+    p_add.add_argument(
+        "identifier",
+        help=(
+            "LinkedIn profile URL (recommended) OR username slug. "
+            "Examples: \"https://linkedin.com/in/karpathy/\" or \"karpathy\""
+        )
+    )
+    p_add.add_argument("--name",     default="", help="Display name label (optional, cosmetic only)")
+    p_add.add_argument("--username", help="Override username (rarely needed)")
+    p_add.add_argument("--note",     default="", help="Why you are tracking this person")
 
     p_rm = p_persons_sub.add_parser("remove", help="Remove a profile")
     p_rm.add_argument("name", help="Display name to remove")
 
-    p_persons_sub.add_parser("list", help="List all tracked profiles")
+    p_persons_sub.add_parser("list", help="List all tracked profiles with stats")
+
+    p_rv = p_persons_sub.add_parser("reverify", help="Force re-verification on next run")
+    p_rv.add_argument("name", help="Display name or username to re-verify")
 
     # ── posts ─────────────────────────────────────────────────────────────────
     p_posts = sub.add_parser("posts", help="Post dedup management")
@@ -656,11 +792,14 @@ Examples:
 
     if args.group == "persons":
         if args.action == "add":
-            add_person(args.name, username=args.username, note=args.note)
+            _cli_add_person(args)
         elif args.action == "remove":
             remove_person(args.name)
         elif args.action == "list":
             print_persons_table(get_all_persons())
+        elif args.action == "reverify":
+            reset_verification(name_to_username(args.name))
+            print(f"[✓] Will re-verify '{args.name}' on next run.")
         else:
             p_persons.print_help()
 
@@ -676,7 +815,7 @@ Examples:
             with get_db() as conn:
                 conn.execute("DELETE FROM posts")
                 conn.execute("DELETE FROM analyses")
-            print("[OK] Cleared all seen posts and analyses. Everything re-analyzed next run.")
+            print("[✓] Cleared all seen posts and analyses. Everything re-analyzed next run.")
         else:
             p_posts.print_help()
 
@@ -686,7 +825,7 @@ Examples:
     else:
         parser.print_help()
         print("\n  Quick start:")
-        print('  python memory.py migrate                          <- import existing data first')
+        print('  python memory.py migrate                          ← import existing data first')
         print('  python memory.py persons add "Harrison Chase"')
         print('  python memory.py persons list')
 

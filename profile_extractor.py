@@ -7,31 +7,30 @@ For each profile in your list:
   1. Navigate to: linkedin.com/in/username/recent-activity/all/
   2. Wait for posts to load
   3. Click "see more" on each post → get FULL text
-  4. Extract latest 1-2 posts only (from the past 2 weeks only)
+  4. Extract latest 1-2 posts only
   5. Return RawPost objects (same interface → analyzer works unchanged)
 
-Browser Provider (set in .env):
-  USE_BROWSERBASE=false  →  Local Playwright (default, free)
-  USE_BROWSERBASE=true   →  Browserbase cloud (stealth, CAPTCHA bypass)
+Why this beats feed scraping:
+  - No sidebar, no ads, no algorithm — just that person's posts
+  - You control exactly who you track
+  - Profile activity pages are simpler DOM than the main feed
+  - Extracting 1-2 posts per profile = low volume = low detection risk
 
 Run standalone:
   python profile_extractor.py
 """
 
-import os
 import asyncio
 import random
 import json
+from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
 from playwright.async_api import async_playwright, Page, Browser
-from dotenv import load_dotenv
 
-load_dotenv()
-
-# RawPost and save_raw_posts live in schemas.py
+# Import RawPost from schemas (unchanged interface)
 from schemas import RawPost, save_raw_posts
-from profiles import load_profiles, build_activity_url
+from profiles import load_profiles
 from logger import setup_logger
 
 log = setup_logger(__name__)
@@ -43,20 +42,36 @@ COOKIES_FILE = Path("session/linkedin_cookies.json")
 
 async def get_browser_with_session():
     """
-    Path A: Launch LOCAL Playwright with saved LinkedIn cookies.
-    Non-headless so LinkedIn doesn't detect automation.
+    Returns an authenticated browser session.
+
+    Path A (default): Local Playwright + saved LinkedIn cookies.
+                      Free, works for personal low-volume use.
+
+    Path B (USE_BROWSERBASE=true in .env): Browserbase cloud browser.
+                      Stealth mode, CAPTCHA solving, verified browser.
+                      Costs ~$20/month for daily use (100 browser hours).
+
+    Switch with: USE_BROWSERBASE=true in .env
     """
+    from browserbase_provider import is_browserbase_enabled
+
+    if is_browserbase_enabled():
+        log.info("[browser] Path B — Browserbase cloud browser (stealth mode)")
+        from browserbase_provider import get_browserbase_browser
+        return await get_browserbase_browser()
+
+    # ── Path A: Local Playwright ───────────────────────────────────────────
+    log.info("[browser] Path A — local Playwright (saved cookies)")
+
     if not COOKIES_FILE.exists():
         raise FileNotFoundError(
             "No cookies at session/linkedin_cookies.json\n"
             "Run: python linkedin_login.py"
         )
 
-    headless = os.getenv("HEADLESS", "false").lower() == "true"
-
     pw = await async_playwright().start()
     browser = await pw.chromium.launch(
-        headless=headless,
+        headless=False,  # MUST be False — headless gets detected
         args=[
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
@@ -73,48 +88,17 @@ async def get_browser_with_session():
         timezone_id="Asia/Kolkata",
     )
 
-    # Load saved cookies
     with open(COOKIES_FILE) as f:
         cookies = json.load(f)
     await context.add_cookies(cookies)
 
     page = await context.new_page()
-
-    # Hide webdriver flag
     await page.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
         window.chrome = { runtime: {} };
     """)
 
     return pw, browser, context, page
-
-
-async def get_browser():
-    """
-    Smart browser factory — checks USE_BROWSERBASE in .env and routes to the
-    correct provider.
-
-    USE_BROWSERBASE=false (default) -> Local Playwright (free, uses session cookies)
-    USE_BROWSERBASE=true            -> Browserbase cloud (stealth, CAPTCHA solving)
-    """
-    from browserbase_provider import is_browserbase_enabled
-
-    if is_browserbase_enabled():
-        log.info("[browser] Path B - Browserbase cloud browser (stealth mode)")
-        try:
-            from browserbase_provider import get_browserbase_browser, check_browserbase_deps
-            if not check_browserbase_deps():
-                raise RuntimeError(
-                    "Browserbase deps missing. Check BROWSERBASE_API_KEY and "
-                    "BROWSERBASE_PROJECT_ID in .env, and run: pip install browserbase"
-                )
-            return await get_browserbase_browser()
-        except Exception as e:
-            log.error(f"[browser] Browserbase failed: {e}")
-            log.error("[browser] Falling back to local Playwright.")
-
-    log.info("[browser] Path A - local Playwright (saved cookies)")
-    return await get_browser_with_session()
 
 
 # ── Post Extraction from Profile Page ────────────────────────────────────────
@@ -132,6 +116,7 @@ async def expand_see_more(page: Page) -> None:
         ".feed-shared-text__see-more",
         "button:has-text('…more')",
         "button:has-text('see more')",
+        ".break-words button",
     ]
 
     for selector in selectors:
@@ -202,15 +187,12 @@ async def extract_posts_from_activity_page(
         log.info(f"[extract] Screenshot saved → session/debug_{author_name.replace(' ', '_')}.png")
         return []
 
-    # Extract up to max_posts valid posts, checking extra containers 
-    # to account for skipped (old/unparseable) posts.
-    for i, container in enumerate(post_containers[:max_posts + 3]):
+    # Extract from first max_posts containers
+    for i, container in enumerate(post_containers[:max_posts]):
         try:
             post = await extract_single_post(container, author_name, i)
             if post:
                 posts.append(post)
-                if len(posts) >= max_posts:
-                    break
         except Exception as e:
             log.warning(f"[extract] Failed post {i+1} for {author_name}: {e}")
             continue
@@ -220,43 +202,6 @@ async def extract_posts_from_activity_page(
 
 async def extract_single_post(container, author_name: str, index: int) -> RawPost | None:
     """Extract data from one post container element."""
-
-    # ── Post Date Filtering ───────────────────────────────────────────────────
-    import re
-    is_too_old = False
-    time_text = ""
-    
-    # Try to find the specific sub-description element which contains the timestamp
-    for sel in [
-        ".update-components-actor__sub-description",
-        ".feed-shared-actor__sub-description",
-        ".profile-creator-shared-feed-update__sub-description"
-    ]:
-        try:
-            el = await container.query_selector(sel)
-            if el:
-                time_text = await el.inner_text()
-                if time_text:
-                    time_text = time_text.lower().replace('\n', ' ')
-                    break
-        except Exception:
-            continue
-
-    if time_text:
-        # Match common LinkedIn relative time formats like "1w", "3 mo", "1yr", "2d", "4 h"
-        match = re.search(r'\b(\d+)\s*(mo|yr|y|w|d|h|m)\b', time_text)
-        if match:
-            num = int(match.group(1))
-            unit = match.group(2)
-            if unit in ['mo', 'yr', 'y']:
-                is_too_old = True
-            elif unit == 'w' and num > 2:
-                is_too_old = True
-                
-    if is_too_old:
-        time_display = time_text.split('•')[0].strip() if '•' in time_text else time_text.strip()
-        log.info(f"[extract] Skipping post for {author_name} — Too old ({time_display})")
-        return None
 
     # ── Post text ─────────────────────────────────────────────────────────────
     post_text = ""
@@ -388,29 +333,26 @@ async def extract_from_all_profiles(
 
     log.info(f"[profiles] Tracking {len(profiles)} profiles, {max_posts_per_profile} posts each")
 
-    pw, browser, context, page = await get_browser()
+    pw, browser, context, page = await get_browser_with_session()
     all_posts = []
 
     try:
         for i, profile in enumerate(profiles, 1):
-            # Support both old JSON ("name") and new memory.db ("display_name") dicts
-            name = profile.get("display_name") or profile.get("name", "Unknown")
+            name = profile["name"]
             activity_url = profile["activity_url"]
-            username = profile.get("username", "")
 
             log.info(f"\n[{i}/{len(profiles)}] {name}")
             log.info(f"  URL: {activity_url}")
 
-            # ── Skip check (saves browser time + tokens) ─────────────────────
-            if username:
-                try:
-                    from memory import should_skip_person
-                    skip, reason = should_skip_person(username)
-                    if skip:
-                        log.info(f"  -> Skipped: {reason}")
-                        continue
-                except Exception:
-                    pass  # skip check failure → proceed normally
+            # ── Skip check (saves browser time + tokens) ─────────────────
+            try:
+                from memory import should_skip_person
+                skip, reason = should_skip_person(profile["username"])
+                if skip:
+                    log.info(f"  → Skipped: {reason}")
+                    continue
+            except Exception:
+                pass  # skip check failure → proceed normally
 
             try:
                 # Navigate to activity page
@@ -429,28 +371,27 @@ async def extract_from_all_profiles(
                     page, name, max_posts=max_posts_per_profile
                 )
 
-                log.info(f"  -> Extracted {len(posts)} posts")
+                log.info(f"  → Extracted {len(posts)} posts")
                 for p in posts:
                     log.info(f"     {p.post_text[:80]}...")
 
                 all_posts.extend(posts)
 
                 # Update memory — posts_seen count (full stats updated after analysis)
-                if username:
-                    try:
-                        from memory import update_person_after_run
-                        update_person_after_run(
-                            username=username,
-                            posts_seen=len(posts),
-                            posts_saved=0,
-                            scores=[],
-                            topics=[],
-                        )
-                    except Exception:
-                        pass
+                try:
+                    from memory import update_person_after_run
+                    update_person_after_run(
+                        username=profile["username"],
+                        posts_seen=len(posts),
+                        posts_saved=0,
+                        scores=[],
+                        topics=[],
+                    )
+                except Exception:
+                    pass
 
             except Exception as e:
-                log.error(f"  -> Failed: {e}")
+                log.error(f"  → Failed: {e}")
                 try:
                     await page.screenshot(
                         path=f"session/debug_{name.replace(' ', '_')}.png"
@@ -473,8 +414,6 @@ async def extract_from_all_profiles(
     log.info(f"\n[profiles] Total posts extracted: {len(all_posts)}")
     save_raw_posts(all_posts)
     return all_posts
-
-
 
 
 # ── Async wrapper for agent.py ────────────────────────────────────────────────
