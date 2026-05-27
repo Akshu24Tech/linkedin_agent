@@ -9,7 +9,7 @@ A personal AI agent that monitors LinkedIn profiles you care about, extracts the
 ## How It Works
 
 ```
-SQLite memory.db (persons table)  <-  managed via profiles.py / memory.py
+SQLite memory.db (persons, posts, analyses)  <-- Token Efficiency Gates (Skip if checked < 20h OR avg score < 3.0)
       |
       v
 Browser opens LinkedIn (local Playwright OR Browserbase cloud - your choice)
@@ -54,10 +54,10 @@ linkedin_agent/
 │                               Only used when USE_BROWSERBASE=true.
 │
 ├── memory.py                 - SQLite-backed memory core. Automatically creates and
-│                               manages the database, handles migrations, and
-│                               provides high-performance querying for profiles/posts/analyses.
+│                               manages the database (session/memory.db), handles schema,
+│                               implements token-efficiency gates, and provides direct CLI.
 │
-├── profiles.py               - Manage your profile watchlist. Wrapper over memory.py
+├── profiles.py               - Manage your profile watchlist. Thin wrapper over memory.py
 │                               supporting CLI and backward-compatible CRUD.
 │
 ├── analyzer.py               - AI brain. Sends each post to Gemini with your
@@ -69,12 +69,10 @@ linkedin_agent/
 │
 ├── notion_saver.py           - Saves relevant posts to Notion. Auto-creates
 │                               the database on first run. Deduplicates by URL.
-│                               Rich page: summary, insight, comment, angle.
 │
 ├── linkedin_login.py         - Handles LinkedIn auth via Playwright.
 │                               Saves cookies so browser only opens once.
-│                               Validates li_at + JSESSIONID are present.
-│
+│   
 ├── dedup_store.py            - Backward-compatibility seen-posts wrapper over memory.py.
 │
 ├── retry.py                  - Exponential backoff for all API calls.
@@ -88,21 +86,14 @@ linkedin_agent/
 ├── scheduler.py              - Runs agent automatically on a schedule.
 │                               Daily at set time, or every N hours.
 │
-├── setup_check.py            - Pre-flight validator. Checks Python version,
-│                               all packages, Playwright, .env keys, Gemini API,
-│                               Notion access, filesystem. Run this first.
+├── setup_check.py            - Pre-flight validator. Checks Python, packages, Playwright,
+│                               .env keys, Gemini API, Notion, filesystem, and database.
 │
 ├── requirements.txt          - All Python dependencies.
 ├── env.example               - Template for credentials. Copy -> .env.
 │
-└── session/                  - Auto-created on first run.
-    ├── linkedin_cookies.json     LinkedIn session (Playwright saves this)
-    ├── bb_context_id.txt         Browserbase context ID (cloud mode only)
-    ├── memory.db                 SQLite database containing persons, posts, and analyses
-    ├── raw_posts.json            Last extraction output (debug)
-    ├── analyzed_posts.json       Last analysis results (full detail)
-    ├── notion_db_id.txt          Cached Notion database ID
-    └── agent.log                 Full run log with timestamps
+└── session/                  - Auto-created on first run. Contains SQLite DB,
+                                cookies, logs, and debug screenshots.
 ```
 
 ---
@@ -182,25 +173,28 @@ Browser opens, logs in, saves cookies to `session/linkedin_cookies.json`. In Bro
 
 ## Usage
 
-### Add profiles to track
+### Add profiles to track (`profiles.py`)
+
+Using a full profile URL is strongly recommended to guarantee the correct user and avoid vanity name collisions on LinkedIn.
 
 ```bash
-# Just provide the name — URL is auto-built
+# RECOMMENDED: Add via profile URL
+python profiles.py add --url "https://linkedin.com/in/karpathy/" --note "AI pioneer"
+python profiles.py add "Harrison Chase" --url "https://www.linkedin.com/in/harrison-chase-961287118/"
+
+# Add via name only (auto-derives vanity name; warns to verify)
 python profiles.py add "Harrison Chase"
 python profiles.py add "Andrej Karpathy" --username karpathy
-python profiles.py add "Shreya Shankar" --note "RAG researcher"
 
 # Manage list
 python profiles.py list
 python profiles.py remove "Yann LeCun"
 ```
 
-> **Username flag:** LinkedIn usernames are usually `firstname-lastname`. If someone uses a custom URL (e.g. `karpathy` instead of `andrej-karpathy`), pass `--username` manually.
-
-### Run the agent
+### Run the agent (`agent.py`)
 
 ```bash
-# Full run (extract → analyze → save to Notion)
+# Full pipeline run (extract → analyze → save to Notion)
 python agent.py
 
 # Test without writing to Notion
@@ -221,7 +215,7 @@ python agent.py --generate-posts
 # Check stats + profile list
 python agent.py --stats
 
-# Validate environment
+# Validate environment setup
 python agent.py --setup-check
 
 # Reset dedup — reprocess all posts
@@ -229,6 +223,33 @@ python agent.py --clear-seen
 
 # Lower save threshold (default 7)
 python agent.py --threshold 6
+
+# Force re-verification for a person (bypasses 20h skip gates)
+python agent.py --reverify "Harrison Chase"
+
+# Add a profile directly via the agent
+python agent.py --add-profile "https://www.linkedin.com/in/karpathy/" --profile-note "AI pioneer"
+```
+
+### Direct SQLite Memory Management (`memory.py`)
+
+The SQLite database backend (`session/memory.db`) can be administered directly:
+
+```bash
+# List tracked profiles with stats directly from database
+python memory.py persons list
+
+# Re-verify a person to rebuild their history
+python memory.py persons reverify "Andrej Karpathy"
+
+# Show database seen and saved stats
+python memory.py posts stats
+
+# Clear seen posts from database (re-extract and re-analyze everything)
+python memory.py posts clear-seen
+
+# One-time migration: Import profiles.json + seen_posts.json into memory.db
+python memory.py migrate
 ```
 
 ### Automate (run daily)
@@ -246,6 +267,18 @@ python scheduler.py --print-cron
 
 ---
 
+## Token Efficiency Gates 🧠
+
+To keep your runs fast and save LLM token costs, the agent implements smart token gates in the SQLite memory core (`memory.py`):
+
+1. **Daily Check Gate**: The agent remembers when each profile was last checked. If a profile was checked less than **20 hours ago**, it will be skipped entirely on subsequent runs that day.
+2. **Consistently Irrelevant Gate**: If a tracked profile is checked **5 or more times** and its `avg_relevance_score` is below **3.0**, the agent will temporarily skip it from daily runs. This ensures you're not opening a browser or wasting Gemini tokens on profiles that consistently post unrelated content.
+
+> **Force Re-verification**: If you want to bypass these gates and force-run a profile immediately, you can reset their verification status using:
+> `python agent.py --reverify "Person Name"`  or  `python memory.py persons reverify "Person Name"`
+
+---
+
 ## What Gets Saved to Notion
 
 Each relevant post (score ≥ 7/10) becomes a rich Notion page:
@@ -260,7 +293,7 @@ Each relevant post (score ≥ 7/10) becomes a rich Notion page:
 | Content Type | `tool_announcement` |
 | Comment Drafted | ✅ |
 | Post URL | Direct link to LinkedIn post |
-| Saved At | `2026-01-04` |
+| Saved At | `2026-05-27` |
 
 **Inside each page:**
 - 📋 **Summary** — 2-3 sentence description of what the post is actually about
