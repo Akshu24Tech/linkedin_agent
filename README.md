@@ -21,7 +21,7 @@ Checks post date -> skips anything older than 2 weeks
 Gets latest 1-2 posts per profile (checks max 5 containers, stops early)
       |
       v
-Gemini 2.0 Flash analyzes each post:
+Gemini 2.5 Flash analyzes each post:
   • Is this relevant to my interests? (score 1-10)
   • What's the key insight?
   • Should I comment? -> drafts a comment in my voice
@@ -293,7 +293,9 @@ Each relevant post (score ≥ 7/10) becomes a rich Notion page:
 | Content Type | `tool_announcement` |
 | Comment Drafted | ✅ |
 | Post URL | Direct link to LinkedIn post |
-| Saved At | `2026-05-27` |
+| Saved At | `2026-05-27` (when we ran the agent) |
+| Posted At | `2026-05-26T14:30:00` (when they posted it) |
+| Post Age (days) | `3.0` |
 
 **Inside each page:**
 - 📋 **Summary** — 2-3 sentence description of what the post is actually about
@@ -327,7 +329,7 @@ To tune it, edit `AKSHU_INTEREST_PROFILE` in `analyzer.py`.
 
 ## Post Date Filtering
 
-The extractor only captures posts from the **last 2 weeks**. If a profile's most recent posts are older than that, they are skipped and the agent moves on. It checks at most **5 post containers** per profile to avoid infinite scrolling, stopping as soon as 2 valid recent posts are found.
+The extractor only captures posts from the last N days (default: **14 days**, configured via `MAX_POST_AGE_DAYS` in `.env`). If a profile's most recent posts are older than that, they are skipped and the agent moves on. It checks at most **5 post containers** per profile to avoid infinite scrolling, stopping as soon as 2 valid recent posts are found. If a post's age is unknown due to layout changes, it is allowed through to avoid false negatives.
 
 ---
 

@@ -6,12 +6,12 @@ Saves analyzed LinkedIn posts to a Notion database.
 What it does:
   1. Creates the database automatically on first run (inside a page you specify)
   2. Saves each relevant post as a full Notion page with all fields
-  3. Deduplicates - won't save the same post twice (checks post_url)
+  3. Deduplicates — won't save the same post twice (checks post_url)
   4. Rich page body: summary, insight, comment draft, content angle
 
 Setup:
   - Get Notion integration token: https://www.notion.so/my-integrations
-  - Create an empty Notion page -> copy its ID from the URL
+  - Create an empty Notion page → copy its ID from the URL
   - Add NOTION_TOKEN and NOTION_PARENT_PAGE_ID to your .env
 
 Run standalone to test:
@@ -44,7 +44,7 @@ def get_headers() -> dict:
         raise ValueError(
             "NOTION_TOKEN not set in .env\n"
             "Get it at: https://www.notion.so/my-integrations\n"
-            "Create integration -> copy 'Internal Integration Secret'"
+            "Create integration → copy 'Internal Integration Secret'"
         )
     return {
         "Authorization": f"Bearer {token}",
@@ -54,18 +54,23 @@ def get_headers() -> dict:
 
 
 def notion_post(endpoint: str, payload: dict) -> dict:
-    """POST to Notion API with error handling."""
-    res = requests.post(
-        f"{NOTION_API_BASE}{endpoint}",
-        headers=get_headers(),
-        json=payload,
-        timeout=15,
-    )
-    if res.status_code not in (200, 201):
-        raise RuntimeError(
-            f"Notion API error {res.status_code}: {res.text[:300]}"
+    """POST to Notion API with error handling and retry."""
+    from retry import with_retry
+
+    def _post():
+        res = requests.post(
+            f"{NOTION_API_BASE}{endpoint}",
+            headers=get_headers(),
+            json=payload,
+            timeout=15,
         )
-    return res.json()
+        if res.status_code not in (200, 201):
+            raise RuntimeError(
+                f"Notion API error {res.status_code}: {res.text[:300]}"
+            )
+        return res.json()
+
+    return with_retry(_post, retries=3, base_delay=3.0, label=f"Notion{endpoint}")
 
 
 def notion_get(endpoint: str) -> dict:
@@ -86,7 +91,7 @@ def create_database(parent_page_id: str) -> str:
     Create the LinkedIn Feed Intelligence database in Notion.
     Returns the new database ID.
     """
-    print(f"[->] Creating Notion database '{DB_TITLE}'...")
+    print(f"[→] Creating Notion database '{DB_TITLE}'...")
 
     payload = {
         "parent": {"type": "page_id", "page_id": parent_page_id},
@@ -127,6 +132,10 @@ def create_database(parent_page_id: str) -> str:
             "Likes": {"rich_text": {}},
         },
     }
+
+    # Add post date and age tracking properties if not present
+    payload["properties"]["Posted At"] = {"date": {}}
+    payload["properties"]["Post Age (days)"] = {"number": {"format": "number"}}
 
     data = notion_post("/databases", payload)
     db_id = data["id"]
@@ -170,7 +179,7 @@ def get_or_create_database() -> str:
             "3. Copy the ID from URL: notion.so/Your-Page-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX\n"
             "   The ID is the last 32 characters (with or without dashes)\n"
             "4. Also share the page with your integration:\n"
-            "   Page -> ··· menu -> Connections -> Add your integration"
+            "   Page → ··· menu → Connections → Add your integration"
         )
 
     return create_database(parent_page_id)
@@ -249,6 +258,18 @@ def build_page_properties(post: RawPost, analysis: PostAnalysis) -> dict:
         },
     }
 
+    # Posted at (when they published — not when we extracted)
+    if post.posted_at and len(post.posted_at) >= 10:
+        try:
+            # Notion requires ISO date format
+            date_str = post.posted_at[:19]  # trim to "YYYY-MM-DDTHH:MM:SS"
+            props["Posted At"] = {"date": {"start": date_str}}
+        except Exception:
+            pass
+
+    if post.post_age_days >= 0:
+        props["Post Age (days)"] = {"number": round(post.post_age_days, 1)}
+
     # URL is optional (might be empty if extraction failed)
     if post.post_url:
         props["Post URL"] = {"url": post.post_url}
@@ -259,7 +280,7 @@ def build_page_properties(post: RawPost, analysis: PostAnalysis) -> dict:
 def build_page_body(post: RawPost, analysis: PostAnalysis) -> list:
     """
     Build rich page content (blocks) for the Notion page.
-    This is the full detail view - everything useful in one place.
+    This is the full detail view — everything useful in one place.
     """
     blocks = []
 
@@ -318,7 +339,7 @@ def build_page_body(post: RawPost, analysis: PostAnalysis) -> list:
         }
 
     # ── Summary section ───────────────────────────────────────────────────────
-    blocks.append(heading2("Summary"))
+    blocks.append(heading2("📋 Summary"))
     blocks.append(paragraph(analysis.post_summary))
 
     # ── Key Insight ───────────────────────────────────────────────────────────
@@ -327,18 +348,18 @@ def build_page_body(post: RawPost, analysis: PostAnalysis) -> list:
 
     # ── Original Post ─────────────────────────────────────────────────────────
     blocks.append(divider())
-    blocks.append(heading2("Original Post"))
-    blocks.append(paragraph(f"By: {post.author_name} - {post.author_headline or 'N/A'}", bold=True))
+    blocks.append(heading2("📝 Original Post"))
+    blocks.append(paragraph(f"By: {post.author_name} — {post.author_headline or 'N/A'}", bold=True))
     if post.post_url:
-        blocks.append(paragraph(f"{post.post_url}"))
+        blocks.append(paragraph(f"🔗 {post.post_url}"))
     blocks.append(paragraph(post.post_text[:2000] if post.post_text else "(No text extracted)"))
 
     # ── Comment Draft ─────────────────────────────────────────────────────────
     if analysis.comment_draft:
         blocks.append(divider())
-        blocks.append(heading2("Comment Draft"))
+        blocks.append(heading2("💬 Comment Draft"))
         blocks.append(callout(
-            "Copy -> edit if needed -> post manually on LinkedIn",
+            "Copy → edit if needed → post manually on LinkedIn",
             emoji="⚠️"
         ))
         blocks.append(code_block(analysis.comment_draft))
@@ -346,16 +367,19 @@ def build_page_body(post: RawPost, analysis: PostAnalysis) -> list:
     # ── Content Angle ─────────────────────────────────────────────────────────
     if analysis.content_angle:
         blocks.append(divider())
-        blocks.append(heading2("Content Angle for Your Posts"))
+        blocks.append(heading2("✍️ Content Angle for Your Posts"))
         blocks.append(callout(analysis.content_angle, emoji="🎯"))
 
     # ── Meta ──────────────────────────────────────────────────────────────────
     blocks.append(divider())
-    blocks.append(heading2("Analysis Details"))
+    blocks.append(heading2("📊 Analysis Details"))
     blocks.append(bulleted(f"Relevance Score: {analysis.relevance_score}/10"))
     blocks.append(bulleted(f"Content Type: {analysis.content_type}"))
     blocks.append(bulleted(f"Topics: {', '.join(analysis.matched_interests)}"))
     blocks.append(bulleted(f"Likes: {post.likes_approx or '?'} | Comments: {post.comments_approx or '?'}"))
+    if post.posted_at:
+        age_str = f"{post.post_age_days:.1f} days ago" if post.post_age_days >= 0 else post.posted_at
+        blocks.append(bulleted(f"Posted: {post.posted_at[:10]} ({age_str})"))
     blocks.append(bulleted(f"Extracted: {post.extracted_at}"))
 
     return blocks
@@ -405,13 +429,29 @@ def save_posts_to_notion(
     ]
 
     if not to_save:
-        print("[i] No posts meet save threshold - nothing to send to Notion.")
+        print("[i] No posts meet save threshold — nothing to send to Notion.")
         return 0
 
-    print(f"\n[->] Saving {len(to_save)} posts to Notion...")
+    print(f"\n[→] Saving {len(to_save)} posts to Notion...")
 
     db_id = get_or_create_database()
     saved_count = 0
+
+    # Ensure database has the Posted At and Post Age properties by calling retrieve/update
+    try:
+        db_details = notion_get(f"/databases/{db_id}")
+        existing_props = db_details.get("properties", {})
+        missing_props = {}
+        if "Posted At" not in existing_props:
+            missing_props["Posted At"] = {"date": {}}
+        if "Post Age (days)" not in existing_props:
+            missing_props["Post Age (days)"] = {"number": {"format": "number"}}
+
+        if missing_props:
+            print("[i] Adding Posted At and Post Age properties to existing database...")
+            notion_post(f"/databases/{db_id}", {"properties": missing_props})
+    except Exception as e:
+        print(f"[!] Warning: Could not check or update database properties: {e}")
 
     for post, analysis in to_save:
         try:
@@ -429,7 +469,7 @@ def save_posts_to_notion(
 # ── Standalone test ───────────────────────────────────────────────────────────
 def main():
     """
-    Test Notion saving with mock data - no LinkedIn or Gemini needed.
+    Test Notion saving with mock data — no LinkedIn or Gemini needed.
     Make sure NOTION_TOKEN and NOTION_PARENT_PAGE_ID are set in .env
     """
     from schemas import RawPost
@@ -469,12 +509,12 @@ def main():
         ),
         key_insight=(
             "Metadata filtering before vector search gives 3x throughput with negligible "
-            "quality loss - most teams skip this and blame the LLM."
+            "quality loss — most teams skip this and blame the LLM."
         ),
         content_type="case_study",
         should_comment=True,
         comment_draft=(
-            "The metadata filtering point is underrated - I've seen the same pattern "
+            "The metadata filtering point is underrated — I've seen the same pattern "
             "in production RAG systems. Most teams over-index on embedding models and "
             "ignore pre-retrieval optimizations. The 3x throughput gain is real."
         ),

@@ -21,16 +21,19 @@ Run standalone:
 """
 
 import asyncio
+import os
 import random
 import json
+import re
 from dataclasses import dataclass, asdict
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from playwright.async_api import async_playwright, Page, Browser
 
 # Import RawPost from schemas (unchanged interface)
 from schemas import RawPost, save_raw_posts
 from profiles import load_profiles
+from memory import build_activity_url
 from logger import setup_logger
 
 log = setup_logger(__name__)
@@ -187,17 +190,215 @@ async def extract_posts_from_activity_page(
         log.info(f"[extract] Screenshot saved → session/debug_{author_name.replace(' ', '_')}.png")
         return []
 
-    # Extract from first max_posts containers
-    for i, container in enumerate(post_containers[:max_posts]):
+    # Extract from containers — stop once we have max_posts within age window
+    # Check up to 5 containers max to avoid infinite scroll
+    MAX_CONTAINERS_TO_CHECK = 5
+    max_age_days = int(os.getenv("MAX_POST_AGE_DAYS", "14"))
+
+    for i, container in enumerate(post_containers[:MAX_CONTAINERS_TO_CHECK]):
+        if len(posts) >= max_posts:
+            break
         try:
             post = await extract_single_post(container, author_name, i)
-            if post:
-                posts.append(post)
+            if not post:
+                continue
+
+            # Age filter — skip posts older than max_age_days
+            if is_post_too_old(post.post_age_days, max_days=max_age_days):
+                age_str = f"{post.post_age_days:.0f}d" if post.post_age_days >= 0 else "unknown"
+                log.info(f"  [date] Skipped post {i+1} — too old ({age_str} > {max_age_days}d)")
+                continue
+
+            # Log date info
+            if post.posted_at:
+                age_str = f"{post.post_age_days:.1f}d ago" if post.post_age_days >= 0 else post.posted_at
+                log.info(f"  [date] Post {i+1} — posted {age_str}")
+            else:
+                log.info(f"  [date] Post {i+1} — date unknown (allowed through)")
+
+            posts.append(post)
+
         except Exception as e:
             log.warning(f"[extract] Failed post {i+1} for {author_name}: {e}")
             continue
 
     return posts
+
+
+def parse_relative_date(text: str) -> tuple[str, float]:
+    """
+    Parse LinkedIn's relative date strings into (posted_at_iso, age_days).
+
+    LinkedIn shows dates as:
+      "2h"  "3d"  "1w"  "2mo"  "1yr"  (short form — activity page)
+      "2 hours ago"  "3 days ago"  "1 week ago"  (long form — sometimes)
+      "2026-05-21T14:30:00.000Z"  (ISO — from datetime attribute)
+
+    Returns:
+      posted_at: ISO string if computable, else original text
+      age_days:  float days since posted, -1 if unknown
+    """
+    if not text:
+        return "", -1
+
+    text = text.strip()
+    now = datetime.now(timezone.utc)
+
+    # ── ISO datetime (from <time datetime="..."> attribute) ───────────────────
+    iso_match = re.match(
+        r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})",
+        text
+    )
+    if iso_match:
+        try:
+            dt = datetime.fromisoformat(iso_match.group(1)).replace(tzinfo=timezone.utc)
+            age = (now - dt).total_seconds() / 86400
+            return dt.isoformat(), round(age, 2)
+        except Exception:
+            pass
+
+    # ── Short relative format (LinkedIn activity page) ────────────────────────
+    # Patterns: "2h", "3d", "1w", "2mo", "1yr"
+    short = re.match(r"^(\d+)\s*(h|hr|d|w|mo|yr)s?$", text.lower().replace(" ", ""))
+    if short:
+        n = int(short.group(1))
+        unit = short.group(2)
+        delta_map = {
+            "h": timedelta(hours=n),
+            "hr": timedelta(hours=n),
+            "d": timedelta(days=n),
+            "w": timedelta(weeks=n),
+            "mo": timedelta(days=n * 30),
+            "yr": timedelta(days=n * 365),
+        }
+        delta = delta_map.get(unit)
+        if delta:
+            dt = now - delta
+            age = delta.total_seconds() / 86400
+            return dt.isoformat(), round(age, 2)
+
+    # ── Long relative format ──────────────────────────────────────────────────
+    # "2 hours ago", "3 days ago", "1 week ago", "2 months ago"
+    long = re.match(
+        r"(\d+)\s+(second|minute|hour|day|week|month|year)s?\s+ago",
+        text.lower()
+    )
+    if long:
+        n = int(long.group(1))
+        unit = long.group(2)
+        delta_map = {
+            "second": timedelta(seconds=n),
+            "minute": timedelta(minutes=n),
+            "hour":   timedelta(hours=n),
+            "day":    timedelta(days=n),
+            "week":   timedelta(weeks=n),
+            "month":  timedelta(days=n * 30),
+            "year":   timedelta(days=n * 365),
+        }
+        delta = delta_map.get(unit)
+        if delta:
+            dt = now - delta
+            age = delta.total_seconds() / 86400
+            return dt.isoformat(), round(age, 2)
+
+    # ── Absolute date (e.g. "May 21, 2026") ──────────────────────────────────
+    abs_match = re.match(
+        r"([A-Za-z]+ \d{1,2},?\s*\d{4})",
+        text
+    )
+    if abs_match:
+        try:
+            dt = datetime.strptime(abs_match.group(1).replace(",", ""), "%B %d %Y")
+            dt = dt.replace(tzinfo=timezone.utc)
+            age = (now - dt).total_seconds() / 86400
+            return dt.isoformat(), round(age, 2)
+        except Exception:
+            pass
+
+    # ── Unknown format — return raw text, age unknown ─────────────────────────
+    return text, -1
+
+
+async def extract_post_date(container) -> tuple[str, float]:
+    """
+    Extract post date from a LinkedIn post container.
+    Tries multiple strategies in order of reliability.
+
+    Returns (posted_at, age_days) — age_days=-1 if unknown.
+    """
+    # Strategy 1: <time> element with datetime attribute (most reliable)
+    # LinkedIn renders this on activity pages
+    for sel in [
+        "time[datetime]",
+        "span[aria-label*='ago'] time",
+        ".feed-shared-actor__sub-description time",
+        ".update-components-actor__sub-description time",
+    ]:
+        try:
+            el = await container.query_selector(sel)
+            if el:
+                # Try datetime attribute first (ISO format)
+                dt_attr = await el.get_attribute("datetime")
+                if dt_attr:
+                    posted_at, age = parse_relative_date(dt_attr)
+                    if posted_at:
+                        return posted_at, age
+
+                # Fallback to inner text of time element ("2d", "3h")
+                text = (await el.inner_text()).strip()
+                if text:
+                    posted_at, age = parse_relative_date(text)
+                    if posted_at:
+                        return posted_at, age
+        except Exception:
+            continue
+
+    # Strategy 2: aria-label containing "ago" (e.g. "2 days ago")
+    for sel in [
+        "[aria-label*='ago']",
+        "[aria-label*='hour']",
+        "[aria-label*='day']",
+        "[aria-label*='week']",
+    ]:
+        try:
+            el = await container.query_selector(sel)
+            if el:
+                label = await el.get_attribute("aria-label") or ""
+                text = await el.inner_text() or ""
+                for candidate in [label, text]:
+                    if candidate:
+                        posted_at, age = parse_relative_date(candidate)
+                        if posted_at:
+                            return posted_at, age
+        except Exception:
+            continue
+
+    # Strategy 3: scan container text for time patterns
+    try:
+        full_text = await container.inner_text()
+        # Look for patterns like "2d •" or "3h •" common on LinkedIn
+        matches = re.findall(
+            r' (\d+\s*(?:h|hr|d|w|mo|yr|hour|day|week|month|year)s?\s*(?:ago)?) ',
+            full_text.lower()
+        )
+        for m in matches:
+            posted_at, age = parse_relative_date(m.strip())
+            if posted_at and age >= 0:
+                return posted_at, age
+    except Exception:
+        pass
+
+    return "", -1
+
+
+def is_post_too_old(age_days: float, max_days: int = 14) -> bool:
+    """
+    Returns True if post is older than max_days.
+    If age is unknown (age_days == -1), allows the post through.
+    """
+    if age_days == -1:
+        return False  # unknown age — don't block it
+    return age_days > max_days
 
 
 async def extract_single_post(container, author_name: str, index: int) -> RawPost | None:
@@ -286,6 +487,9 @@ async def extract_single_post(container, author_name: str, index: int) -> RawPos
     except Exception:
         pass
 
+    # ── Post date ─────────────────────────────────────────────────────────────
+    posted_at, age_days = await extract_post_date(container)
+
     # ── URN / Post ID ─────────────────────────────────────────────────────────
     post_id = f"{author_name}_{index}_{hash(post_text[:40])}"
     try:
@@ -298,7 +502,7 @@ async def extract_single_post(container, author_name: str, index: int) -> RawPos
     return RawPost(
         post_id=post_id,
         author_name=author_name,
-        author_headline="",  # Not needed — we know who this is
+        author_headline="",
         post_text=post_text,
         post_url=post_url,
         has_image=has_image,
@@ -307,6 +511,8 @@ async def extract_single_post(container, author_name: str, index: int) -> RawPos
         comments_approx=comments,
         extracted_at=datetime.now().isoformat(),
         screenshot_path="",
+        posted_at=posted_at,
+        post_age_days=age_days,
     )
 
 

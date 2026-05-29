@@ -145,6 +145,8 @@ class RawPost:
     comments_approx: str
     extracted_at: str
     screenshot_path: str
+    posted_at: str = ""
+    post_age_days: float = -1
 
 def save_raw_posts(posts: list[RawPost], path: str = "session/raw_posts.json") -> None:
     Path("session").mkdir(exist_ok=True)
