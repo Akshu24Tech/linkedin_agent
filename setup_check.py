@@ -85,9 +85,12 @@ def check_packages():
         "langchain_core": "langchain-core",
         "langchain_google_genai": "langchain-google-genai",
         "google.generativeai": "google-generativeai",
+        "langgraph": "langgraph",
+        "duckduckgo_search": "duckduckgo-search",
     }
     optional = {
         "langchain_groq": "langchain-groq (optional - Groq fallback)",
+        "tavily": "tavily-python (optional - Tavily search)",
     }
 
     for module, pkg in required.items():

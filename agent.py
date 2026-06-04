@@ -54,8 +54,10 @@ def parse_args():
     parser.add_argument("--generate-posts", action="store_true")
     parser.add_argument("--setup-check",    action="store_true")
     parser.add_argument("--reverify",        metavar="NAME", help="Force re-verification for a person")
-    parser.add_argument("--add-profile",     metavar="URL",  help="Add a LinkedIn profile URL to track")
+    parser.add_argument("--add-profile",     nargs="?", const="interactive", metavar="URL", help="Add a LinkedIn profile URL to track. Prompts if URL not provided.")
     parser.add_argument("--profile-note",    metavar="NOTE", default="", help="Note for --add-profile")
+    parser.add_argument("--discover",        action="store_true", help="Run the LangGraph Profile Discovery Agent")
+    parser.add_argument("--auto-add",        action="store_true", help="Auto-add discovered profiles with score >= threshold without prompt")
     parser.add_argument("--threshold", type=int, default=7)
     return parser.parse_args()
 
@@ -284,11 +286,40 @@ async def main():
     if getattr(args, 'add_profile', None):
         from memory import add_person, username_from_url
         url = args.add_profile
+        name = ""
+        note = getattr(args, 'profile_note', '')
+        
+        if url == "interactive":
+            print("\n" + "═"*45)
+            print("  Add Tracked Profile Manually")
+            print("═"*45)
+            try:
+                url = input("LinkedIn Profile URL: ").strip()
+                if not url:
+                    print("[!] Profile URL is required.")
+                    return
+                name = input("Display Name (optional - press Enter to auto-derive): ").strip()
+                note = input("Profile Note (optional - e.g. 'LangGraph founder'): ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print("\n[i] Cancelled.")
+                return
+
         vanity = username_from_url(url)
         if not vanity:
             print(f'[✗] Could not extract username from: {url}')
             return
-        add_person(name=vanity, url=url, note=getattr(args, 'profile_note', ''))
+        
+        display_name = name or vanity
+        add_person(name=display_name, username=vanity, url=url, note=note)
+        return
+
+    if getattr(args, 'discover', False):
+        from profile_discovery_agent import run_discovery
+        run_discovery(
+            dry_run=args.dry_run,
+            auto_add=args.auto_add,
+            threshold=args.threshold
+        )
         return
     if args.generate_posts:
         import post_generator; post_generator.main(); return

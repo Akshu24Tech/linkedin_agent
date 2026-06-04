@@ -7,5 +7,8 @@ langchain-core>=0.3.0
 requests>=2.31.0
 notion-client>=2.0.0
 
-# Browserbase (cloud browser — needed when USE_BROWSERBASE=true in .env)
-browserbase>=0.5.0
+
+# LangGraph Profile Discovery Agent
+langgraph>=0.2.2
+tavily-python>=0.3.8
+duckduckgo-search>=6.1.7

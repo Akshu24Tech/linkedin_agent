@@ -45,26 +45,12 @@ COOKIES_FILE = Path("session/linkedin_cookies.json")
 
 async def get_browser_with_session():
     """
-    Returns an authenticated browser session.
+    Returns an authenticated browser session using local Playwright + saved cookies.
+    Free, works for personal low-volume use.
 
-    Path A (default): Local Playwright + saved LinkedIn cookies.
-                      Free, works for personal low-volume use.
-
-    Path B (USE_BROWSERBASE=true in .env): Browserbase cloud browser.
-                      Stealth mode, CAPTCHA solving, verified browser.
-                      Costs ~$20/month for daily use (100 browser hours).
-
-    Switch with: USE_BROWSERBASE=true in .env
+    Pre-requisite: run `python linkedin_login.py` once to create the cookie file.
     """
-    from browserbase_provider import is_browserbase_enabled
-
-    if is_browserbase_enabled():
-        log.info("[browser] Path B — Browserbase cloud browser (stealth mode)")
-        from browserbase_provider import get_browserbase_browser
-        return await get_browserbase_browser()
-
-    # ── Path A: Local Playwright ───────────────────────────────────────────
-    log.info("[browser] Path A — local Playwright (saved cookies)")
+    log.info("[browser] Local Playwright (saved cookies)")
 
     if not COOKIES_FILE.exists():
         raise FileNotFoundError(

@@ -74,6 +74,12 @@ Other:
     # list
     sub.add_parser("list", help="List all tracked profiles with stats")
 
+    # discover
+    p_disc = sub.add_parser("discover", help="Run Profile Discovery Agent to search for new profiles")
+    p_disc.add_argument("--dry-run", action="store_true", help="Perform search and evaluation without saving to database")
+    p_disc.add_argument("--auto-add", action="store_true", help="Automatically add profiles scoring at or above threshold without prompt")
+    p_disc.add_argument("--threshold", type=int, default=7, help="Relevance score threshold (1-10) for saving/highlighting profiles")
+
     args = parser.parse_args()
 
     if args.cmd == "add":
@@ -98,6 +104,10 @@ Other:
 
     elif args.cmd == "list":
         print_persons_table(get_all_persons())
+
+    elif args.cmd == "discover":
+        from profile_discovery_agent import run_discovery
+        run_discovery(dry_run=args.dry_run, auto_add=args.auto_add, threshold=args.threshold)
 
     else:
         parser.print_help()

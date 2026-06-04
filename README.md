@@ -12,7 +12,7 @@ A personal AI agent that monitors LinkedIn profiles you care about, extracts the
 SQLite memory.db (persons, posts, analyses)  <-- Token Efficiency Gates (Skip if checked < 20h OR avg score < 3.0)
       |
       v
-Browser opens LinkedIn (local Playwright OR Browserbase cloud - your choice)
+Browser opens LinkedIn (local Playwright with saved cookies)
       |
       v
 Navigates to each person's activity page
@@ -44,14 +44,8 @@ linkedin_agent/
 ├── profile_extractor.py      - Core scraper. Opens LinkedIn, navigates to
 │                               each profile's activity page, clicks "see more",
 │                               filters by 2-week date window,
-│                               extracts latest posts per person.
-│                               Routes to local Playwright OR Browserbase
-│                               based on USE_BROWSERBASE in .env.
-│
-├── browserbase_provider.py   - Browserbase cloud browser (Path B).
-│                               Stealth mode, CAPTCHA solving, persistent
-│                               LinkedIn session via Contexts API.
-│                               Only used when USE_BROWSERBASE=true.
+│                               extracts latest posts per person using
+│                               local Playwright with saved cookies.
 │
 ├── memory.py                 - SQLite-backed memory core. Automatically creates and
 │                               manages the database (session/memory.db), handles schema,
@@ -139,35 +133,19 @@ Open `.env` and fill in:
 
 > **Notion page setup:** After setting the page ID, go to that page → `···` menu → Connections → Add your integration. Required or you'll get a 403.
 
-### 4. Choose your browser mode
-
-The agent supports two browser backends. Switch by editing one line in `.env`:
-
-| Setting | What it does |
-|---|---|
-| `USE_BROWSERBASE=false` | **Local Playwright** (default) — free, uses saved cookies, runs locally |
-| `USE_BROWSERBASE=true` | **Browserbase cloud** — stealth mode, CAPTCHA solving, verified browser |
-
-**For Browserbase**, also add to `.env`:
-```env
-BROWSERBASE_API_KEY=bb_live_xxxxx
-BROWSERBASE_PROJECT_ID=proj_xxxxx
-```
-Get both at [browserbase.com/settings](https://browserbase.com/settings). Free tier = 1 hr total. Developer plan ($20/mo) = 100 hrs (~3 months of daily use).
-
-### 5. Validate everything
+### 4. Validate everything
 
 ```bash
 python setup_check.py
 ```
 
-### 6. Login to LinkedIn (one-time, local mode only)
+### 5. Login to LinkedIn (one-time setup)
 
 ```bash
 python linkedin_login.py
 ```
 
-Browser opens, logs in, saves cookies to `session/linkedin_cookies.json`. In Browserbase mode, login is handled automatically on first run using your `.env` credentials.
+Browser opens, logs in, and saves cookies to `session/linkedin_cookies.json`. After this, the agent uses saved cookies — no re-login needed.
 
 ---
 
@@ -343,8 +321,6 @@ The extractor only captures posts from the last N days (default: **14 days**, co
 **"Session expired" error (local mode)**
 - Delete `session/linkedin_cookies.json` and re-run `python linkedin_login.py`
 
-**Browserbase context expired**
-- Delete `session/bb_context_id.txt` — a fresh context with new login will be created on next run
 
 **Gemini rate limit**
 - Free tier: 15 req/min. `retry.py` auto-waits 60s and retries.
@@ -366,8 +342,7 @@ python profiles.py add "Person Name" --username correct-username
 
 | Layer | Tool |
 |---|---|
-| Browser automation (local) | Playwright (Python) |
-| Browser automation (cloud) | Browserbase (stealth, CAPTCHA solving) |
+| Browser automation | Playwright (Python) |
 | LLM | Gemini 2.0 Flash (via `langchain-google-genai`) |
 | Structured output | Pydantic + `with_structured_output(method="json_schema")` |
 | Storage | Notion API (via `requests`) |
