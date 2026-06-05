@@ -94,9 +94,9 @@ def get_llm():
 
     if gemini_key and gemini_key != "your_gemini_api_key_here":
         from langchain_google_genai import ChatGoogleGenerativeAI
-        print("[i] Using Gemini 2.0 Flash for analysis")
+        print("[i] Using Gemini 2.5 Flash for analysis")
         return ChatGoogleGenerativeAI(
-            model="gemini-2.0-flash",
+            model="gemini-2.5-flash",
             google_api_key=gemini_key,
             temperature=0.1,  # Low temp = consistent, structured responses
         )

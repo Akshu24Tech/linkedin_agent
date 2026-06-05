@@ -82,7 +82,7 @@ def generate_post_draft(angle: dict) -> str:
 
     import google.generativeai as genai
     genai.configure(api_key=gemini_key)
-    model = genai.GenerativeModel("gemini-2.0-flash")
+    model = genai.GenerativeModel("gemini-2.5-flash")
 
     prompt = f"""
 {AKSH_VOICE_PROMPT}

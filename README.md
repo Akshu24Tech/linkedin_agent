@@ -41,6 +41,9 @@ linkedin_agent/
 │
 ├── agent.py                  - Main entry point. All commands live here.
 │
+├── profile_discovery_agent.py- Agent that discovers high-quality profiles via web search,
+│                               scores them with Gemini, and adds them to your watchlist.
+│
 ├── profile_extractor.py      - Core scraper. Opens LinkedIn, navigates to
 │                               each profile's activity page, clicks "see more",
 │                               filters by 2-week date window,
@@ -151,7 +154,25 @@ Browser opens, logs in, and saves cookies to `session/linkedin_cookies.json`. Af
 
 ## Usage
 
-### Add profiles to track (`profiles.py`)
+### Discover profiles automatically (`profile_discovery_agent.py`)
+
+Finds new builders and creators matching your interests via LangGraph search and Gemini scoring.
+
+```bash
+# Discover and interactively approve profiles
+python profile_discovery_agent.py
+
+# Test search without saving anything to the database
+python profile_discovery_agent.py --dry-run
+
+# Automatically add profiles scoring 7 or higher
+python profile_discovery_agent.py --auto-add
+
+# Change the minimum score threshold (default is 7)
+python profile_discovery_agent.py --auto-add --threshold 8
+```
+
+### Add profiles manually (`profiles.py`)
 
 Using a full profile URL is strongly recommended to guarantee the correct user and avoid vanity name collisions on LinkedIn.
 
@@ -343,7 +364,7 @@ python profiles.py add "Person Name" --username correct-username
 | Layer | Tool |
 |---|---|
 | Browser automation | Playwright (Python) |
-| LLM | Gemini 2.0 Flash (via `langchain-google-genai`) |
+| LLM | Gemini 2.5 Flash (via `langchain-google-genai`) |
 | Structured output | Pydantic + `with_structured_output(method="json_schema")` |
 | Storage | Notion API (via `requests`) |
 | Retry logic | Custom exponential backoff (`retry.py`) |
@@ -359,7 +380,7 @@ Set in `.env` - Gemini is primary, Groq is fallback:
 
 | Provider | Free Tier | Key Variable | Model Used |
 |---|---|---|---|
-| **Gemini Flash** | 1M tokens/day | `GEMINI_API_KEY` | `gemini-2.0-flash` |
+| **Gemini Flash** | 1M tokens/day | `GEMINI_API_KEY` | `gemini-2.5-flash` |
 | **Groq** | Rate limited | `GROQ_API_KEY` | `llama-3.3-70b-versatile` |
 
 To switch to Groq, comment out the Gemini block and uncomment Groq in `analyzer.py -> get_llm()`.
