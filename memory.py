@@ -41,7 +41,6 @@ CLI:
   python memory.py persons remove "karpathy"
   python memory.py posts stats
   python memory.py posts clear-seen
-  python memory.py migrate          ← import existing profiles.json + seen_posts.json
 """
 
 import sqlite3
@@ -114,6 +113,7 @@ def init_db() -> None:
                 extracted_at    TEXT NOT NULL,
                 was_analyzed    INTEGER DEFAULT 0,  -- 1 if Gemini was called
                 was_saved       INTEGER DEFAULT 0,  -- 1 if saved to Notion
+                linkedin_saved  INTEGER DEFAULT 0,  -- 1 if saved to LinkedIn Saved Posts
                 relevance_score INTEGER DEFAULT 0,
                 FOREIGN KEY (author_username) REFERENCES persons(username)
             );
@@ -146,6 +146,18 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_persons_active
                 ON persons(is_active);
         """)
+
+        # ── Migration: add linkedin_saved column to existing DBs ────────────
+        # ALTER TABLE ignores the ADD COLUMN if it already exists in SQLite 3.37+
+        # For older SQLite we catch the error gracefully.
+        try:
+            conn.execute(
+                "ALTER TABLE posts ADD COLUMN linkedin_saved INTEGER DEFAULT 0"
+            )
+            log.info("[memory] Migrated: added linkedin_saved column to posts")
+        except Exception:
+            pass  # column already exists — no action needed
+
     log.info(f"[memory] DB ready at {DB_PATH}")
 
 
@@ -490,6 +502,48 @@ def mark_post_analyzed(post_id: str, score: int, saved: bool) -> None:
         """, (1 if saved else 0, score, post_id))
 
 
+def mark_post_linkedin_saved(post_id: str, post_url: str = "") -> None:
+    """
+    Mark a post as saved to LinkedIn Saved Posts.
+    Called by post_saver.py after a successful Save click.
+    Prevents re-saving the same post on the next run.
+    """
+    init_db()
+    with get_db() as conn:
+        if post_id:
+            conn.execute(
+                "UPDATE posts SET linkedin_saved = 1 WHERE post_id = ?",
+                (post_id,)
+            )
+        elif post_url:
+            conn.execute(
+                "UPDATE posts SET linkedin_saved = 1 WHERE post_url = ?",
+                (post_url,)
+            )
+
+
+def is_post_linkedin_saved(post_id: str, post_url: str = "") -> bool:
+    """
+    Check if a post was already saved to LinkedIn Saved Posts in a previous run.
+    Prevents duplicate Save clicks across runs.
+    """
+    init_db()
+    with get_db() as conn:
+        if post_id:
+            row = conn.execute(
+                "SELECT linkedin_saved FROM posts WHERE post_id = ?", (post_id,)
+            ).fetchone()
+            if row and row[0]:
+                return True
+        if post_url:
+            row = conn.execute(
+                "SELECT linkedin_saved FROM posts WHERE post_url = ?", (post_url,)
+            ).fetchone()
+            if row and row[0]:
+                return True
+    return False
+
+
 def save_analysis(post_id: str, analysis) -> None:
     """
     Store full Gemini analysis result.
@@ -582,61 +636,6 @@ def stats() -> dict:
     }
 
 
-# ── Migration from old JSON files ─────────────────────────────────────────────
-
-def migrate_from_json() -> None:
-    """
-    One-time migration from old profiles.json + seen_posts.json → memory.db
-    Safe to run multiple times (uses INSERT OR IGNORE).
-    """
-    init_db()
-    migrated_persons = 0
-    migrated_posts = 0
-
-    # Migrate profiles.json
-    profiles_file = Path("session/profiles.json")
-    if profiles_file.exists():
-        with open(profiles_file) as f:
-            profiles = json.load(f)
-        for p in profiles:
-            try:
-                add_person(
-                    name=p["name"],
-                    username=p["username"],
-                    note=p.get("note", ""),
-                )
-                migrated_persons += 1
-            except Exception as e:
-                log.warning(f"[migrate] Skipped person {p.get('name')}: {e}")
-        log.info(f"[migrate] Imported {migrated_persons} persons from profiles.json")
-
-    # Migrate seen_posts.json
-    seen_file = Path("session/seen_posts.json")
-    if seen_file.exists():
-        with open(seen_file) as f:
-            seen = json.load(f)
-        with get_db() as conn:
-            for post_id in seen.get("post_ids", []):
-                conn.execute(
-                    "INSERT OR IGNORE INTO posts (post_id, post_url, extracted_at) VALUES (?,?,?)",
-                    (post_id, "", datetime.now().isoformat())
-                )
-                migrated_posts += 1
-            for url in seen.get("post_urls", []):
-                conn.execute(
-                    "INSERT OR IGNORE INTO posts (post_id, post_url, extracted_at) VALUES (?,?,?)",
-                    (f"url_{hash(url)}", url, datetime.now().isoformat())
-                )
-                migrated_posts += 1
-        log.info(f"[migrate] Imported {migrated_posts} seen posts from seen_posts.json")
-
-    print(f"\n[✓] Migration complete:")
-    print(f"    Persons imported: {migrated_persons}")
-    print(f"    Posts imported:   {migrated_posts}")
-    print(f"    Database:         {DB_PATH}")
-    print(f"\n    Old files kept (you can delete them manually):")
-    print(f"    session/profiles.json")
-    print(f"    session/seen_posts.json")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -731,7 +730,6 @@ Examples:
   python memory.py persons list
   python memory.py posts stats
   python memory.py posts clear-seen
-  python memory.py migrate
         """
     )
 
@@ -785,9 +783,6 @@ RISKY (only for very unique names):
     p_posts_sub.add_parser("stats", help="Show post stats")
     p_posts_sub.add_parser("clear-seen", help="Clear all seen posts (re-analyze everything)")
 
-    # ── migrate ───────────────────────────────────────────────────────────────
-    sub.add_parser("migrate", help="Import profiles.json + seen_posts.json into memory.db")
-
     args = parser.parse_args()
 
     if args.group == "persons":
@@ -819,13 +814,9 @@ RISKY (only for very unique names):
         else:
             p_posts.print_help()
 
-    elif args.group == "migrate":
-        migrate_from_json()
-
     else:
         parser.print_help()
         print("\n  Quick start:")
-        print('  python memory.py migrate                          ← import existing data first')
         print('  python memory.py persons add "Harrison Chase"')
         print('  python memory.py persons list')
 

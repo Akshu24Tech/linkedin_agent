@@ -6,6 +6,8 @@ pydantic>=2.0.0
 langchain-core>=0.3.0
 requests>=2.31.0
 notion-client>=2.0.0
+fastapi>=0.111.0
+uvicorn>=0.29.0
 
 
 # LangGraph Profile Discovery Agent

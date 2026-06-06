@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LinkedIn Feed Intelligence</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      width: 340px;
+      min-height: 200px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0f0f13;
+      color: #e8e8ed;
+    }
+
+    .header {
+      background: linear-gradient(135deg, #0a66c2 0%, #004182 100%);
+      padding: 14px 16px 12px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .header-icon {
+      width: 28px;
+      height: 28px;
+      background: white;
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 16px;
+      flex-shrink: 0;
+    }
+
+    .header-text h1 {
+      font-size: 13px;
+      font-weight: 700;
+      color: white;
+      line-height: 1.2;
+    }
+
+    .header-text p {
+      font-size: 10px;
+      color: rgba(255,255,255,0.7);
+      margin-top: 2px;
+    }
+
+    .server-status {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 8px 16px;
+      background: #1a1a22;
+      border-bottom: 1px solid #2a2a35;
+      font-size: 11px;
+    }
+
+    .status-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: #888;
+      flex-shrink: 0;
+    }
+    .status-dot.online { background: #22c55e; box-shadow: 0 0 6px #22c55e66; }
+    .status-dot.offline { background: #ef4444; }
+    .status-dot.checking { background: #f59e0b; animation: pulse 1s infinite; }
+
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+    .content { padding: 14px 16px; }
+
+    .page-info {
+      background: #1a1a22;
+      border: 1px solid #2a2a35;
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin-bottom: 14px;
+      font-size: 11px;
+    }
+
+    .page-info .label {
+      color: #888;
+      margin-bottom: 3px;
+    }
+
+    .page-info .url {
+      color: #a78bfa;
+      word-break: break-all;
+      line-height: 1.4;
+    }
+
+    .page-info .warning {
+      color: #f59e0b;
+      margin-top: 4px;
+    }
+
+    .btn {
+      width: 100%;
+      padding: 10px 16px;
+      border: none;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      transition: all 0.15s;
+      margin-bottom: 8px;
+    }
+
+    .btn-primary {
+      background: linear-gradient(135deg, #0a66c2, #0057ad);
+      color: white;
+    }
+    .btn-primary:hover:not(:disabled) {
+      background: linear-gradient(135deg, #1a76d2, #0a66c2);
+      transform: translateY(-1px);
+    }
+    .btn-primary:disabled {
+      background: #333;
+      color: #666;
+      cursor: not-allowed;
+      transform: none;
+    }
+
+    .btn-secondary {
+      background: #1a1a22;
+      color: #a78bfa;
+      border: 1px solid #2a2a35;
+    }
+    .btn-secondary:hover {
+      background: #22223a;
+      border-color: #a78bfa44;
+    }
+
+    .results {
+      margin-top: 10px;
+    }
+
+    .result-card {
+      background: #1a1a22;
+      border: 1px solid #2a2a35;
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin-bottom: 8px;
+      font-size: 11px;
+      line-height: 1.5;
+    }
+
+    .result-card.saved {
+      border-color: #22c55e44;
+      background: #0d1f14;
+    }
+
+    .result-card.skipped {
+      border-color: #2a2a35;
+      opacity: 0.7;
+    }
+
+    .result-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      margin-bottom: 4px;
+    }
+
+    .author-name {
+      font-weight: 600;
+      color: #e8e8ed;
+      font-size: 12px;
+    }
+
+    .score-badge {
+      background: #0a66c2;
+      color: white;
+      padding: 1px 6px;
+      border-radius: 4px;
+      font-size: 10px;
+      font-weight: 700;
+      flex-shrink: 0;
+    }
+    .score-badge.high { background: #22c55e; color: #001a0a; }
+    .score-badge.mid  { background: #f59e0b; color: #1a0a00; }
+    .score-badge.low  { background: #444; color: #999; }
+
+    .result-summary {
+      color: #aaa;
+      font-size: 10.5px;
+      margin-top: 2px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .result-status {
+      font-size: 10px;
+      margin-top: 4px;
+    }
+    .result-status.saved-to-notion { color: #22c55e; }
+    .result-status.skipped-msg { color: #888; }
+
+    .stats-bar {
+      display: flex;
+      gap: 12px;
+      padding: 10px 0;
+      border-top: 1px solid #2a2a35;
+      margin-top: 8px;
+    }
+
+    .stat {
+      text-align: center;
+      flex: 1;
+    }
+
+    .stat-value {
+      font-size: 18px;
+      font-weight: 700;
+      color: #e8e8ed;
+    }
+
+    .stat-label {
+      font-size: 9px;
+      color: #666;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .loading {
+      text-align: center;
+      padding: 20px;
+      color: #888;
+      font-size: 12px;
+    }
+
+    .spinner {
+      width: 20px;
+      height: 20px;
+      border: 2px solid #333;
+      border-top-color: #0a66c2;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      margin: 0 auto 10px;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .error-msg {
+      background: #1f0a0a;
+      border: 1px solid #ef444433;
+      border-radius: 8px;
+      padding: 10px 12px;
+      color: #f87171;
+      font-size: 11px;
+      margin-top: 8px;
+      line-height: 1.5;
+    }
+
+    .threshold-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 12px;
+      font-size: 11px;
+      color: #888;
+    }
+
+    .threshold-row label { flex: 1; }
+
+    .threshold-row input[type="number"] {
+      width: 48px;
+      background: #1a1a22;
+      border: 1px solid #2a2a35;
+      color: #e8e8ed;
+      border-radius: 6px;
+      padding: 4px 8px;
+      font-size: 12px;
+      text-align: center;
+    }
+
+    .empty-state {
+      text-align: center;
+      padding: 16px;
+      color: #666;
+      font-size: 11px;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Header -->
+  <div class="header">
+    <div class="header-icon">🤖</div>
+    <div class="header-text">
+      <h1>LinkedIn Feed Intelligence</h1>
+      <p>Gemini analysis → Notion</p>
+    </div>
+  </div>
+
+  <!-- Server status -->
+  <div class="server-status">
+    <div class="status-dot checking" id="statusDot"></div>
+    <span id="statusText">Checking local server...</span>
+  </div>
+
+  <!-- Main content -->
+  <div class="content" id="mainContent">
+
+    <!-- Page info -->
+    <div class="page-info" id="pageInfo">
+      <div class="label">Current page</div>
+      <div class="url" id="pageUrl">Loading...</div>
+    </div>
+
+    <!-- Threshold -->
+    <div class="threshold-row">
+      <label for="threshold">Save threshold (score ≥)</label>
+      <input type="number" id="threshold" min="1" max="10" value="7" />
+    </div>
+
+    <!-- Scan button -->
+    <button class="btn btn-primary" id="scanBtn" disabled>
+      <span>🔍</span>
+      <span>Scan This Page</span>
+    </button>
+
+    <!-- View last results button -->
+    <button class="btn btn-secondary" id="viewLastBtn">
+      <span>📋</span>
+      <span>View Last Results</span>
+    </button>
+
+    <!-- Results area -->
+    <div class="results" id="resultsArea"></div>
+
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

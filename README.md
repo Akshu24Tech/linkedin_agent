@@ -1,35 +1,41 @@
 # LinkedIn Feed Intelligence Agent 🤖
 
-A personal AI agent that monitors LinkedIn profiles you care about, extracts their latest posts (from the past 2 weeks only), filters them by your interests using Gemini, and saves the relevant ones to Notion — with summaries, key insights, and ready-to-post comment drafts.
+A personal AI agent that monitors LinkedIn profiles you care about, filters them by your interests using Gemini, and saves the relevant ones to Notion — with summaries, key insights, and ready-to-post comment drafts.
 
 > Built to solve a real problem: missing valuable posts while scrolling LinkedIn, and never having time to engage with the right content at the right time.
 
 ---
 
-## How It Works
+## Two Modes
+
+### Mode A — Chrome Extension (Recommended)
+Runs inside your real Chrome browser. No automation flags, no bot detection risk.
 
 ```
-SQLite memory.db (persons, posts, analyses)  <-- Token Efficiency Gates (Skip if checked < 20h OR avg score < 3.0)
-      |
-      v
-Browser opens LinkedIn (local Playwright with saved cookies)
-      |
-      v
-Navigates to each person's activity page
-Clicks "see more" -> extracts full post text (no truncation)
-Checks post date -> skips anything older than 2 weeks
-Gets latest 1-2 posts per profile (checks max 5 containers, stops early)
-      |
-      v
-Gemini 2.5 Flash analyzes each post:
-  • Is this relevant to my interests? (score 1-10)
-  • What's the key insight?
-  • Should I comment? -> drafts a comment in my voice
-  • Could this become my own LinkedIn post?
-      |
-      v
-Score >= 7 -> saved to Notion + recorded in SQLite database
-Score < 7 -> skipped, recorded in SQLite (dedup) for instant lookup
+You navigate to a LinkedIn activity page in Chrome
+         │
+  Chrome Extension reads the DOM
+  (your real session, your real browser fingerprint)
+         │  HTTP POST → localhost:8765
+  Local Python server (server.py)
+         │
+  memory.py → skip already-seen posts (zero Gemini calls)
+         │
+  Gemini scores each new post (1–10)
+         │
+  Score ≥ 7 → saved to Notion + SQLite
+```
+
+### Mode B — Playwright CLI (Legacy)
+Fully automated but uses a separate browser process LinkedIn can detect.
+
+```
+SQLite memory.db ← Token Efficiency Gates (skip if checked < 20h OR avg score < 3.0)
+         │
+Playwright opens LinkedIn with saved cookies
+Navigates each profile's activity page → extracts posts
+         │
+Gemini scores → Score ≥ 7 saved to Notion
 ```
 
 ---
@@ -39,12 +45,15 @@ Score < 7 -> skipped, recorded in SQLite (dedup) for instant lookup
 ```
 linkedin_agent/
 │
-├── agent.py                  - Main entry point. All commands live here.
+├── agent.py                  - CLI entry point. Full Playwright pipeline.
+│
+├── server.py                 - FastAPI local server for Chrome Extension mode.
+│                               Receives posts from extension → runs analysis → saves to Notion.
 │
 ├── profile_discovery_agent.py- Agent that discovers high-quality profiles via web search,
 │                               scores them with Gemini, and adds them to your watchlist.
 │
-├── profile_extractor.py      - Core scraper. Opens LinkedIn, navigates to
+├── profile_extractor.py      - Core Playwright scraper. Opens LinkedIn, navigates to
 │                               each profile's activity page, clicks "see more",
 │                               filters by 2-week date window,
 │                               extracts latest posts per person using
@@ -69,8 +78,6 @@ linkedin_agent/
 │
 ├── linkedin_login.py         - Handles LinkedIn auth via Playwright.
 │                               Saves cookies so browser only opens once.
-│   
-├── dedup_store.py            - Backward-compatibility seen-posts wrapper over memory.py.
 │
 ├── retry.py                  - Exponential backoff for all API calls.
 │                               Gemini rate limits -> 60s auto-wait.
@@ -88,6 +95,14 @@ linkedin_agent/
 │
 ├── requirements.txt          - All Python dependencies.
 ├── env.example               - Template for credentials. Copy -> .env.
+│
+├── extension/                - Chrome Extension (Mode A — no bot detection risk)
+│   ├── manifest.json         - Chrome MV3 manifest
+│   ├── content_script.js     - Reads LinkedIn post DOM inside your real browser
+│   ├── background.js         - MV3 service worker
+│   ├── popup.html            - Extension popup UI
+│   ├── popup.js              - Popup controller (calls server.py)
+│   └── icons/                - Extension icons
 │
 └── session/                  - Auto-created on first run. Contains SQLite DB,
                                 cookies, logs, and debug screenshots.
@@ -246,9 +261,6 @@ python memory.py posts stats
 
 # Clear seen posts from database (re-extract and re-analyze everything)
 python memory.py posts clear-seen
-
-# One-time migration: Import profiles.json + seen_posts.json into memory.db
-python memory.py migrate
 ```
 
 ### Automate (run daily)
@@ -262,6 +274,88 @@ python scheduler.py --now --time 09:00
 
 # Print cron / Windows Task Scheduler commands
 python scheduler.py --print-cron
+```
+
+---
+
+## Chrome Extension Mode (Recommended)
+
+The extension runs inside your **real Chrome browser** using your real LinkedIn session — no automation flags, no separate browser process, no bot detection risk.
+
+### 1. Start the local server
+
+```bash
+# Activate your venv first
+venv\Scripts\activate   # Windows
+source venv/bin/activate  # Mac/Linux
+
+python server.py
+```
+
+You should see:
+```
+══════════════════════════════════════════════════════
+  LinkedIn Feed Intelligence — Local Server
+══════════════════════════════════════════════════════
+  URL:             http://localhost:8765
+  Posts in memory: 42
+  Posts saved:     8
+  Persons tracked: 5
+```
+
+Leave this terminal running. The server must be running whenever you use the extension.
+
+### 2. Install the extension in Chrome
+
+1. Open Chrome and go to **`chrome://extensions`**
+2. Enable **Developer Mode** (toggle in the top-right corner)
+3. Click **Load unpacked**
+4. Select the **`extension/`** folder inside the project
+5. The 🤖 icon appears in your Chrome toolbar
+
+> You only need to do this once. The extension persists across Chrome restarts.
+
+### 3. Scan a LinkedIn profile
+
+1. Go to any tracked person's LinkedIn activity page:
+   ```
+   https://www.linkedin.com/in/karpathy/recent-activity/all/
+   ```
+2. Click the **🤖 extension icon** in the Chrome toolbar
+3. Check the server status dot is **green** (online)
+4. Adjust the **score threshold** if needed (default: 7)
+5. Click **Scan This Page**
+
+The extension will:
+- Read all visible post cards from the page DOM
+- Send them to the local server
+- Run Gemini analysis (skips already-seen posts automatically)
+- Save qualifying posts (score ≥ threshold) to Notion
+- Show per-post results in the popup with score badges
+
+### 4. What the popup shows
+
+| Badge | Meaning |
+|---|---|
+| 🟢 Green score (8-10) | High relevance — saved to Notion |
+| 🟡 Yellow score (5-7) | Medium — saved if above threshold |
+| ⚫ Grey score (1-4) | Low relevance — skipped |
+| ⏭ Already in memory | Seen before — zero Gemini tokens used |
+| ✅ Saved to Notion | Notion page created |
+| ⊘ Reason | Why this post was skipped |
+
+### Server API (for debugging)
+
+```bash
+# Check server health + memory stats
+curl http://localhost:8765/health
+
+# View results from last scan
+curl http://localhost:8765/results
+
+# Full API docs (interactive)
+# Open in browser:
+http://localhost:8765/docs
 ```
 
 ---
@@ -342,7 +436,6 @@ The extractor only captures posts from the last N days (default: **14 days**, co
 **"Session expired" error (local mode)**
 - Delete `session/linkedin_cookies.json` and re-run `python linkedin_login.py`
 
-
 **Gemini rate limit**
 - Free tier: 15 req/min. `retry.py` auto-waits 60s and retries.
 - Reduce profiles or run at off-peak times
@@ -357,13 +450,30 @@ python profiles.py remove "Person Name"
 python profiles.py add "Person Name" --username correct-username
 ```
 
+**Extension popup shows "Server offline"**
+- Make sure `python server.py` is running in a terminal
+- Check your venv is activated before running the server
+- Confirm port 8765 is free: `netstat -ano | findstr 8765`
+
+**Extension shows "No post cards found"**
+- Make sure you're on an activity page, not a main profile page
+- The URL should look like: `linkedin.com/in/username/recent-activity/all/`
+- Try refreshing the LinkedIn page, then click Scan again
+- LinkedIn may have updated its DOM — check `extension/content_script.js` selectors
+
+**Extension installed but icon missing from toolbar**
+- Click the puzzle piece 🧩 icon in Chrome toolbar
+- Pin **LinkedIn Feed Intelligence** to the toolbar
+
 ---
 
 ## Tech Stack
 
 | Layer | Tool |
 |---|---|
-| Browser automation | Playwright (Python) |
+| Chrome Extension | Manifest V3 (content script + popup) |
+| Extension bridge | FastAPI + uvicorn (`server.py`, localhost:8765) |
+| Browser automation (legacy) | Playwright (Python) |
 | LLM | Gemini 2.5 Flash (via `langchain-google-genai`) |
 | Structured output | Pydantic + `with_structured_output(method="json_schema")` |
 | Storage | Notion API (via `requests`) |

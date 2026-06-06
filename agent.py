@@ -1,10 +1,11 @@
 """
 agent.py — LinkedIn Feed Intelligence Agent
-Full pipeline: Profile list → Extract → Analyze → Save to Notion
+Full pipeline: Profile list → Extract → Analyze → Save to LinkedIn → Save to Notion
 
 COMMANDS:
-  python agent.py                      Full run
-  python agent.py --dry-run            Analyze but don't save to Notion
+  python agent.py                      Full run (auto-saves qualifying posts to LinkedIn)
+  python agent.py --dry-run            Analyze but don't save to LinkedIn or Notion
+  python agent.py --save-posts         Save qualifying posts from last run to LinkedIn Saved Posts
   python agent.py --extract-only       Just extract posts, skip analysis
   python agent.py --analyze-only       Re-analyze session/raw_posts.json
   python agent.py --view-saved         Pretty-print last saved posts + comment drafts
@@ -47,6 +48,7 @@ def parse_args():
     parser.add_argument("--extract-only",   action="store_true")
     parser.add_argument("--analyze-only",   action="store_true")
     parser.add_argument("--dry-run",        action="store_true")
+    parser.add_argument("--save-posts",     action="store_true", help="Save qualifying posts from last run to LinkedIn Saved Posts")
     parser.add_argument("--stats",          action="store_true")
     parser.add_argument("--test-notion",    action="store_true")
     parser.add_argument("--view-saved",     action="store_true")
@@ -217,6 +219,12 @@ def step_save_notion(all_results: list) -> int:
     return save_posts_to_notion(all_results)
 
 
+async def step_save_linkedin(all_results: list, threshold: int = 7) -> list:
+    """Open qualifying posts in browser and click the LinkedIn Save button."""
+    from post_saver import save_posts_to_linkedin
+    return await save_posts_to_linkedin(all_results, threshold=threshold)
+
+
 def step_persist_json(all_results: list) -> None:
     Path("session").mkdir(exist_ok=True)
     output = [{"post": asdict(p), "analysis": a.model_dump()} for p, a in all_results]
@@ -237,26 +245,35 @@ def load_raw_posts_from_json() -> list:
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 
-def print_summary(all_results, saved_posts, notion_count, dry_run=False):
+def print_summary(all_results, saved_posts, linkedin_results, notion_count, dry_run=False):
     total = len(all_results)
     saved = len(saved_posts)
-    print("\n" + "═"*60)
+    li_saved  = sum(1 for r in linkedin_results if r.status == "saved") if linkedin_results else 0
+    li_already = sum(1 for r in linkedin_results if r.status == "already_saved") if linkedin_results else 0
+
+    print("\n" + "\u2550"*60)
     print(f"  RUN COMPLETE  {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    print("═"*60)
-    print(f"  Analyzed:       {total}")
-    print(f"  Relevant (≥7):  {saved}")
-    print(f"  Notion:         {'[dry run]' if dry_run else notion_count}")
-    print("═"*60)
+    print("\u2550"*60)
+    print(f"  Analyzed:            {total}")
+    print(f"  Relevant (\u22657):       {saved}")
+    if dry_run:
+        print(f"  LinkedIn Save:       [dry run]")
+        print(f"  Notion:              [dry run]")
+    else:
+        li_str = f"{li_saved} saved" + (f" | {li_already} already saved" if li_already else "")
+        print(f"  LinkedIn Save:       {li_str if linkedin_results else 'skipped'}")
+        print(f"  Notion:              {notion_count}")
+    print("\u2550"*60)
 
     for i, (post, analysis) in enumerate(saved_posts, 1):
-        bar = "█" * analysis.relevance_score + "░" * (10 - analysis.relevance_score)
+        bar = "\u2588" * analysis.relevance_score + "\u2591" * (10 - analysis.relevance_score)
         print(f"\n  [{i}] [{bar}] {analysis.relevance_score}/10  {post.author_name}")
         print(f"       {analysis.post_summary[:100]}...")
-        print(f"       💡 {analysis.key_insight[:85]}...")
+        print(f"       \U0001f4a1 {analysis.key_insight[:85]}...")
         if analysis.comment_draft:
-            print(f"       💬 Comment ready — run --view-saved to copy")
+            print(f"       \U0001f4ac Comment ready — run --view-saved to copy")
         if analysis.content_angle:
-            print(f"       ✍️  {analysis.content_angle[:70]}...")
+            print(f"       \u270f\ufe0f  {analysis.content_angle[:70]}...")
 
     if not saved_posts:
         print("\n  No posts met threshold.")
@@ -324,6 +341,17 @@ async def main():
     if args.generate_posts:
         import post_generator; post_generator.main(); return
 
+    # ── --save-posts: standalone command ──────────────────────────────────
+    if args.save_posts:
+        print("\n" + "\u2550"*55)
+        print("  LinkedIn Post Saver")
+        print(f"  Saving posts with score \u2265 {args.threshold} from last run")
+        print("\u2550"*55 + "\n")
+        from post_saver import save_from_last_run, print_save_summary
+        results = await save_from_last_run(threshold=args.threshold)
+        print_save_summary(results)
+        return
+
     # ── Check profiles exist before doing anything ────────────────────────────
     from profiles import load_profiles
     if not args.analyze_only:
@@ -336,10 +364,10 @@ async def main():
             print()
             return
 
-    print("\n" + "═"*60)
+    print("\n" + "\u2550"*60)
     print("  LinkedIn Feed Intelligence Agent")
-    print("  Profile-based extraction → Gemini analysis → Notion")
-    print("═"*60)
+    print("  Extract \u2192 Gemini Analysis \u2192 LinkedIn Save \u2192 Notion")
+    print("\u2550"*60)
 
     # ── Extract ───────────────────────────────────────────────────────────────
     if args.analyze_only:
@@ -382,11 +410,25 @@ async def main():
 
     step_persist_json(all_results)
 
-    # ── Notion ────────────────────────────────────────────────────────────────
+    # ── LinkedIn Save ──────────────────────────────────────────────
+    linkedin_results = []
+    if not args.dry_run:
+        print(f"\n[STEP 3] Saving qualifying posts to LinkedIn Saved Posts")
+        print("\u2500"*42)
+        try:
+            linkedin_results = await step_save_linkedin(all_results, threshold=args.threshold)
+        except Exception as e:
+            log.error(f"[saver] {e}")
+            print(f"[!] LinkedIn Save failed: {e}")
+            print("    You can retry manually: python agent.py --save-posts")
+    else:
+        print("\n[STEP 3] LinkedIn Save SKIPPED (--dry-run)")
+
+    # ── Notion ────────────────────────────────────────────────
     notion_count = 0
     if not args.dry_run:
-        print(f"\n[STEP 3] Saving to Notion")
-        print("─"*42)
+        print(f"\n[STEP 4] Saving to Notion")
+        print("\u2500"*42)
         try:
             notion_count = step_save_notion(all_results)
         except Exception as e:
@@ -394,9 +436,9 @@ async def main():
             print(f"[!] Notion save failed: {e}")
             print("    Posts saved locally to session/analyzed_posts.json")
     else:
-        print("\n[STEP 3] Notion SKIPPED (--dry-run)")
+        print("\n[STEP 4] Notion SKIPPED (--dry-run)")
 
-    print_summary(all_results, saved_posts, notion_count, dry_run=args.dry_run)
+    print_summary(all_results, saved_posts, linkedin_results, notion_count, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
